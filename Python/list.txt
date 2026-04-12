@@ -1,0 +1,5 @@
+# Watchlista tablic "niebezpiecznych" kierowcow.
+# Format: jedna rejestracja na linie.
+# Dozwolone sa tez wpisy z myslnikiem lub spacja (np. WR-3804R).
+
+EBECA32

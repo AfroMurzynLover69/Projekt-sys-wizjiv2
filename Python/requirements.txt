@@ -1,0 +1,7 @@
+fast-alpr[onnx]==0.4.0
+opencv-python>=4.10,<5
+ultralytics==8.4.22
+lap>=0.5.12
+fastapi>=0.115,<1
+uvicorn>=0.32,<1
+python-multipart>=0.0.9,<1

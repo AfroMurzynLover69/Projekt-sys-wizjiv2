@@ -1,0 +1,6 @@
+Python/video/
+Python/**/__pycache__/
+*.pyc
+Python/models/yolo11x.pt
+Python/models/license_plate_detector.pt
+Python/web_data/
