@@ -10,6 +10,7 @@ from .config import (
     AI_EVERY_N_FRAMES,
     APP_TITLE,
     DANGEROUS_PLATES_LIST,
+    DEFAULT_AI_PROFILE,
     ENABLE_YOLO_VEHICLE_TRACKING,
     PLATE_MAX_AREA_RATIO,
     PLATE_MAX_ASPECT,
@@ -20,6 +21,7 @@ from .config import (
     YOLO_DEVICE,
     YOLO_VEHICLE_CONF,
     YOLO_VEHICLE_LABEL,
+    get_ai_profile,
 )
 from .media import is_image_file
 from .models_runtime import init_ocr_engine, init_vehicle_tracker
@@ -50,9 +52,10 @@ class RuntimeState:
     vehicle_ids: list[int]
     tracker_config: str | None
     dangerous_plates: set[str]
+    profile: dict
 
 
-_RUNTIME: RuntimeState | None = None
+_RUNTIMES: dict[str, RuntimeState] = {}
 _RUNTIME_LOCK = Lock()
 
 
@@ -65,30 +68,33 @@ def _check_highgui_support() -> bool:
         return False
 
 
-def _get_runtime() -> RuntimeState:
-    global _RUNTIME
-    if _RUNTIME is not None:
-        return _RUNTIME
+def _get_runtime(profile_id: str | None = None) -> RuntimeState:
+    profile = get_ai_profile(profile_id)
+    profile_key = str(profile["id"])
+    if profile_key in _RUNTIMES:
+        return _RUNTIMES[profile_key]
 
     with _RUNTIME_LOCK:
-        if _RUNTIME is not None:
-            return _RUNTIME
+        if profile_key in _RUNTIMES:
+            return _RUNTIMES[profile_key]
 
-        ocr_engine = init_ocr_engine()
+        ocr_engine = init_ocr_engine(profile)
         vehicle_model = None
         vehicle_ids: list[int] = []
         tracker_config = None
-        if ENABLE_YOLO_VEHICLE_TRACKING:
-            vehicle_model, vehicle_ids, tracker_config = init_vehicle_tracker()
+        if bool(profile.get("enable_yolo_vehicle_tracking", ENABLE_YOLO_VEHICLE_TRACKING)):
+            vehicle_model, vehicle_ids, tracker_config = init_vehicle_tracker(profile)
 
-        _RUNTIME = RuntimeState(
+        runtime = RuntimeState(
             ocr_engine=ocr_engine,
             vehicle_model=vehicle_model,
             vehicle_ids=vehicle_ids,
             tracker_config=tracker_config,
             dangerous_plates=_load_dangerous_plates(DANGEROUS_PLATES_LIST),
+            profile=profile,
         )
-        return _RUNTIME
+        _RUNTIMES[profile_key] = runtime
+        return runtime
 
 
 def _close_preview(can_preview: bool) -> None:
@@ -366,6 +372,7 @@ def _extract_vehicle_predictions(
     vehicle_model,
     vehicle_ids: list[int],
     tracker_config: str | None,
+    yolo_device: str | None = None,
 ) -> list[tuple[int, int, int, int, int | None]]:
     if vehicle_model is None or not vehicle_ids:
         return []
@@ -374,7 +381,7 @@ def _extract_vehicle_predictions(
             source=frame,
             classes=vehicle_ids,
             conf=YOLO_VEHICLE_CONF,
-            device=YOLO_DEVICE,
+            device=yolo_device or YOLO_DEVICE,
             tracker=tracker_config or "bytetrack.yaml",
             persist=True,
             verbose=False,
@@ -385,7 +392,7 @@ def _extract_vehicle_predictions(
                 source=frame,
                 classes=vehicle_ids,
                 conf=YOLO_VEHICLE_CONF,
-                device=YOLO_DEVICE,
+                device=yolo_device or YOLO_DEVICE,
                 verbose=False,
             )[0]
         except Exception:
@@ -477,6 +484,7 @@ def _draw_overlay(
     tracker_config=None,
     dangerous_plates: set[str] | None = None,
     filter_mode: str = "normal",
+    profile: dict | None = None,
 ):
     annotated = frame.copy()
     vehicle_predictions = _extract_vehicle_predictions(
@@ -484,6 +492,7 @@ def _draw_overlay(
         vehicle_model,
         vehicle_ids or [],
         tracker_config,
+        str((profile or {}).get("yolo_device") or YOLO_DEVICE),
     )
     predictions = _extract_plate_predictions(frame, ocr_engine, filter_mode=filter_mode)
     dangerous_plates = dangerous_plates or set()
@@ -523,7 +532,7 @@ def _draw_overlay(
 
     cv2.putText(
         annotated,
-        f"{APP_TITLE} {RUNTIME_DEVICE.upper()}",
+        f"{APP_TITLE} {str((profile or {}).get('label') or RUNTIME_DEVICE).upper()}",
         (20, 32),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.8,
@@ -616,8 +625,9 @@ def analyze_frame(
     seconds: float = 0.0,
     history_dir: Path | None = None,
     filter_mode: str = "normal",
+    ai_profile: str = DEFAULT_AI_PROFILE,
 ) -> tuple[object, list[DetectionEvent]]:
-    runtime = _get_runtime()
+    runtime = _get_runtime(ai_profile)
     processed_frame = _apply_filter_mode(frame, filter_mode)
     annotated, predictions = _draw_overlay(
         processed_frame,
@@ -627,6 +637,7 @@ def analyze_frame(
         runtime.tracker_config,
         runtime.dangerous_plates,
         filter_mode=filter_mode,
+        profile=runtime.profile,
     )
     events = _build_events_from_predictions(
         annotated,
@@ -645,6 +656,7 @@ def run_image_detection(
     source_name: str | None = None,
     history_dir: Path | None = None,
     filter_mode: str = "normal",
+    ai_profile: str = DEFAULT_AI_PROFILE,
 ) -> DetectionResult:
     if not image_path.exists():
         print(f"Missing: {image_path}")
@@ -656,7 +668,7 @@ def run_image_detection(
         return DetectionResult(1, None, "image")
 
     try:
-        runtime = _get_runtime()
+        runtime = _get_runtime(ai_profile)
     except RuntimeError as error:
         print(str(error))
         return DetectionResult(1, None, "image")
@@ -673,6 +685,7 @@ def run_image_detection(
         runtime.tracker_config,
         runtime.dangerous_plates,
         filter_mode=filter_mode,
+        profile=runtime.profile,
     )
     saved = _write_image(out_path, annotated)
     if not saved:
@@ -704,6 +717,7 @@ def run_detection(
     source_name: str | None = None,
     history_dir: Path | None = None,
     filter_mode: str = "normal",
+    ai_profile: str = DEFAULT_AI_PROFILE,
 ) -> DetectionResult:
     if not video_path.exists():
         print(f"Missing: {video_path}")
@@ -717,6 +731,7 @@ def run_detection(
             source_name=source_name,
             history_dir=history_dir,
             filter_mode=filter_mode,
+            ai_profile=ai_profile,
         )
 
     cap = cv2.VideoCapture(str(video_path))
@@ -725,7 +740,7 @@ def run_detection(
         return DetectionResult(1, None, "video")
 
     try:
-        runtime = _get_runtime()
+        runtime = _get_runtime(ai_profile)
     except RuntimeError as error:
         print(str(error))
         cap.release()
@@ -760,7 +775,8 @@ def run_detection(
                 break
             frame_idx += 1
             seconds = (frame_idx - 1) / effective_fps if effective_fps > 0 else 0.0
-            should_process = last_out is None or (frame_idx % AI_EVERY_N_FRAMES) == 0
+            every_n_frames = int(runtime.profile.get("ai_every_n_frames") or AI_EVERY_N_FRAMES)
+            should_process = last_out is None or (frame_idx % max(1, every_n_frames)) == 0
 
             if should_process:
                 processed_frame = _apply_filter_mode(frame, filter_mode)
@@ -772,6 +788,7 @@ def run_detection(
                     runtime.tracker_config,
                     runtime.dangerous_plates,
                     filter_mode=filter_mode,
+                    profile=runtime.profile,
                 )
                 minute_idx = int(seconds // 60)
                 for x1, y1, x2, y2, text, _confidence in processed_predictions:

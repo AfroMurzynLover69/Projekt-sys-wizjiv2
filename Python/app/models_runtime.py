@@ -21,17 +21,19 @@ except Exception:
     YOLO = None
 
 
-def init_ocr_engine():
+def init_ocr_engine(profile: dict | None = None):
     if FastALPR is None:
         raise RuntimeError("Missing fast-alpr.")
 
+    runtime_device = str((profile or {}).get("runtime_device") or RUNTIME_DEVICE)
+    onnx_providers = list((profile or {}).get("onnx_providers") or ONNX_PROVIDERS)
     engine = FastALPR(
         detector_model=FAST_ALPR_DETECTOR_MODEL,
         detector_conf_thresh=FAST_ALPR_DETECTOR_CONF,
-        detector_providers=ONNX_PROVIDERS,
+        detector_providers=onnx_providers,
         ocr_model=FAST_ALPR_OCR_MODEL,
-        ocr_device=RUNTIME_DEVICE,
-        ocr_providers=ONNX_PROVIDERS,
+        ocr_device=runtime_device,
+        ocr_providers=onnx_providers,
     )
     return engine
 
@@ -43,16 +45,17 @@ def _choose_tracker_config() -> str:
     return "bytetrack.yaml"
 
 
-def init_vehicle_tracker():
+def init_vehicle_tracker(profile: dict | None = None):
     if YOLO is None:
         return None, [], None
 
+    yolo_device = str((profile or {}).get("yolo_device") or YOLO_DEVICE)
     for candidate in YOLO_VEHICLE_MODEL_CANDIDATES:
         if not candidate.exists():
             continue
         model = YOLO(str(candidate))
         try:
-            model.to(YOLO_DEVICE)
+            model.to(yolo_device)
         except Exception:
             pass
         vehicle_ids = [

@@ -1,4 +1,5 @@
 Python/video/
+Python/venv/
 Python/**/__pycache__/
 *.pyc
 Python/models/yolo11x.pt
