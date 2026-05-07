@@ -17,11 +17,13 @@ AI_PROFILES = {
         "yolo_device": "cpu",
         "onnx_providers": ["CPUExecutionProvider"],
         "ai_every_n_frames": 12,
-        "enable_yolo_vehicle_tracking": False,
+        "enable_yolo_vehicle_tracking": True,
         "live_interval_ms": 2600,
         "live_jpeg_quality": 0.45,
         "live_max_width": 640,
         "full_file_analysis": False,
+        "yolo_vehicle_model": "yolov8n.pt",
+        "yolo_imgsz": 640,
         "description": "mniejsze obciazenie CPU",
     },
     "gpu_heavy": {
@@ -55,10 +57,10 @@ YOLO_VEHICLE_LABEL = "SAMOCHOD"
 YOLO_DEVICE = "cpu"
 YOLO_VEHICLE_NAMES = {"car", "truck", "bus", "motorcycle"}
 YOLO_VEHICLE_MODEL_CANDIDATES = [
-    BASE_DIR / "yolo11x.pt",
     BASE_DIR / "models" / "yolo11x.pt",
-    BASE_DIR / "yolov8n.pt",
     BASE_DIR / "models" / "yolov8n.pt",
+    BASE_DIR / "yolo11x.pt",
+    BASE_DIR / "yolov8n.pt",
 ]
 YOLO_TRACKER_CONFIG_CANDIDATES = [
     BASE_DIR / "bytetrack_plates.yaml",

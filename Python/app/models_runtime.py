@@ -1,4 +1,5 @@
 from pathlib import Path
+import shutil
 
 from .config import (
     BASE_DIR,
@@ -22,6 +23,35 @@ try:
     from ultralytics import YOLO
 except Exception:
     YOLO = None
+
+
+def _resolve_yolo_weight(model_name: str) -> Path | str:
+    model_path = Path(model_name)
+    if model_path.is_absolute():
+        return model_path
+
+    if len(model_path.parts) == 1 and model_path.suffix == ".pt":
+        target = BASE_DIR / "models" / model_path.name
+        legacy = BASE_DIR / model_path.name
+        if target.exists():
+            return target
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if legacy.exists():
+            try:
+                legacy.replace(target)
+            except OSError:
+                shutil.copy2(legacy, target)
+            return target
+
+        try:
+            from ultralytics.utils.downloads import attempt_download_asset
+
+            return Path(attempt_download_asset(target))
+        except Exception:
+            return target
+
+    return BASE_DIR / model_path
 
 
 def init_ocr_engine(profile: dict | None = None):
@@ -56,13 +86,7 @@ def init_vehicle_tracker(profile: dict | None = None):
     profile_model = str((profile or {}).get("yolo_vehicle_model") or "").strip()
     candidates: list[Path | str] = []
     if profile_model:
-        candidates.extend(
-            [
-                BASE_DIR / profile_model,
-                BASE_DIR / "models" / profile_model,
-                profile_model,
-            ]
-        )
+        candidates.append(_resolve_yolo_weight(profile_model))
     candidates.extend(YOLO_VEHICLE_MODEL_CANDIDATES)
 
     seen: set[str] = set()

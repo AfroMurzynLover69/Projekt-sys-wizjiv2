@@ -1,45 +1,28 @@
 # Projekt sys-wizjiv2 - ALPR
 
-## Skad sa modele
+## Modele i zrodla
 
-Modele uzyte w projekcie sa gotowymi modelami z zewnetrznych bibliotek. Nie
-byly trenowane od zera w tym projekcie.
+Projekt uzywa gotowych modeli. Nie byly trenowane w tym repozytorium.
 
-Model `Python/models/yolov8n.pt` jest gotowym, pobranym modelem YOLOv8n od
-Ultralytics. W aplikacji sluzy do wykrywania pojazdow, m.in. klas `car`,
-`truck`, `bus` i `motorcycle`.
+- Tablice rejestracyjne i OCR: `fast-alpr` od `ankandrew`
+  - detekcja tablic: `yolo-v9-t-384-license-plate-end2end`
+  - odczyt tekstu: `european-plates-mobile-vit-v2-model`
+  - glowne zrodlo: https://github.com/ankandrew/fast-alpr
+  - zrodla:
+    - https://github.com/ankandrew/open-image-models
+    - https://github.com/ankandrew/fast-plate-ocr
+    - https://ankandrew.github.io/fast-plate-ocr/latest/inference/model_zoo/
 
-Oficjalne zrodlo:
+- Pojazdy: Ultralytics YOLO
+  - CPU Lite: `Python/models/yolov8n.pt`
+  - GPU Heavy: `Python/models/yolo11x.pt`
+  - fallback: jezeli `yolo11x.pt` nie dziala albo go nie ma, kod moze uzyc `yolov8n.pt`
+  - zrodla:
+    - https://github.com/ultralytics/ultralytics
+    - https://github.com/ultralytics/assets/releases
 
-- GitHub Ultralytics: https://github.com/ultralytics/ultralytics
-- Gotowe wagi YOLOv8n: https://github.com/ultralytics/assets/releases/download/v8.3.0/yolov8n.pt
-
-Rozpoznawanie tablic korzysta z biblioteki `fast-alpr`. Ta biblioteka sklada
-caly pipeline ALPR z dwoch gotowych czesci:
-
-- detekcja tablic: `open-image-models`,
-- OCR, czyli odczyt tekstu tablicy: `fast-plate-ocr`.
-
-Oficjalne zrodla:
-
-- FastALPR: https://github.com/ankandrew/fast-alpr
-- modele detekcji tablic `open-image-models`: https://github.com/ankandrew/open-image-models
-- modele OCR tablic `fast-plate-ocr`: https://github.com/ankandrew/fast-plate-ocr
-- model zoo OCR: https://ankandrew.github.io/fast-plate-ocr/latest/inference/model_zoo/
-
-W projekcie sa ustawione gotowe modele z tych bibliotek:
-
-- `yolo-v9-t-384-license-plate-end2end`
-- `european-plates-mobile-vit-v2-model`
-
-`yolo-v9-t-384-license-plate-end2end` to gotowy model do wykrywania obszaru
-tablicy rejestracyjnej. Pochodzi z `open-image-models`.
-
-`european-plates-mobile-vit-v2-model` to gotowy model OCR do odczytu tekstu
-europejskich tablic rejestracyjnych. Wedlug dokumentacji `fast-plate-ocr` jest
-to model wytrenowany na europejskich tablicach z ponad 40 krajow i na ponad
-40 tysiacach tablic. Ten model nie byl trenowany w tym projekcie, tylko jest
-uzywany jako gotowy model z biblioteki.
+YOLO sluzy tutaj do wykrywania pojazdow (`car`, `truck`, `bus`, `motorcycle`).
+FastALPR sluzy do wykrywania tablic i odczytu numeru rejestracyjnego.
 
 ## Opis projektu
 
@@ -80,12 +63,11 @@ Skrypt tworzy lokalne srodowisko `venv`, instaluje zaleznosci z
 
 ## Profile pracy
 
-`CPU Lite` jest profilem lekkim. Wysyla do analizy mniejsze klatki, analizuje
-rzadziej i nie uruchamia pelnego renderowania filmu w tle. Ten tryb jest
-przeznaczony do komputerow bez mocnej karty graficznej.
+`CPU Lite` uzywa FastALPR do tablic i OCR oraz `yolov8n.pt` do pojazdow na CPU.
+Analizuje rzadziej i jest przeznaczony do slabszych komputerow.
 
-`GPU Heavy` jest profilem mocniejszym. Probuje uzyc CUDA, analizuje czesciej,
-wlacza wykrywanie/sledzenie pojazdow i tworzy pelny wynikowy film z ramkami.
+`GPU Heavy` uzywa FastALPR do tablic i OCR oraz `yolo11x.pt` do pojazdow na GPU.
+Analizuje czesciej i tworzy pelny wynikowy film z ramkami.
 
 ## Najwazniejsze pliki
 
@@ -94,4 +76,5 @@ wlacza wykrywanie/sledzenie pojazdow i tworzy pelny wynikowy film z ramkami.
 - `Python/app/models_runtime.py` - ladowanie modeli ALPR i YOLO,
 - `Python/app/config.py` - konfiguracja progow, modeli i profili pracy,
 - `Python/models/yolov8n.pt` - gotowy model YOLOv8n,
+- `Python/models/yolo11x.pt` - gotowy model YOLO11x,
 - `Python/list.txt` - lista tablic oznaczanych jako niebezpieczne.
