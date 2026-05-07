@@ -29,13 +29,15 @@ AI_PROFILES = {
         "runtime_device": "cuda",
         "yolo_device": "0",
         "onnx_providers": ["CUDAExecutionProvider", "CPUExecutionProvider"],
-        "ai_every_n_frames": 3,
+        "ai_every_n_frames": 1,
         "enable_yolo_vehicle_tracking": True,
-        "live_interval_ms": 500,
-        "live_jpeg_quality": 0.82,
-        "live_max_width": 1280,
+        "live_interval_ms": 80,
+        "live_jpeg_quality": 0.95,
+        "live_max_width": 1920,
         "full_file_analysis": True,
-        "description": "czestsza analiza i sledzenie pojazdow",
+        "yolo_vehicle_model": "yolo11x.pt",
+        "yolo_imgsz": 1280,
+        "description": "maksymalna analiza CUDA i sledzenie pojazdow",
     },
 }
 PLATE_TEXT_MIN_LEN = 5
@@ -53,10 +55,10 @@ YOLO_VEHICLE_LABEL = "SAMOCHOD"
 YOLO_DEVICE = "cpu"
 YOLO_VEHICLE_NAMES = {"car", "truck", "bus", "motorcycle"}
 YOLO_VEHICLE_MODEL_CANDIDATES = [
-    BASE_DIR / "yolov8n.pt",
-    BASE_DIR / "models" / "yolov8n.pt",
     BASE_DIR / "yolo11x.pt",
     BASE_DIR / "models" / "yolo11x.pt",
+    BASE_DIR / "yolov8n.pt",
+    BASE_DIR / "models" / "yolov8n.pt",
 ]
 YOLO_TRACKER_CONFIG_CANDIDATES = [
     BASE_DIR / "bytetrack_plates.yaml",

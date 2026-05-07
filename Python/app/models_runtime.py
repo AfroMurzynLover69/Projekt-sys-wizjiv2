@@ -1,4 +1,7 @@
+from pathlib import Path
+
 from .config import (
+    BASE_DIR,
     FAST_ALPR_DETECTOR_CONF,
     FAST_ALPR_DETECTOR_MODEL,
     FAST_ALPR_OCR_MODEL,
@@ -50,10 +53,27 @@ def init_vehicle_tracker(profile: dict | None = None):
         return None, [], None
 
     yolo_device = str((profile or {}).get("yolo_device") or YOLO_DEVICE)
-    for candidate in YOLO_VEHICLE_MODEL_CANDIDATES:
-        if not candidate.exists():
+    profile_model = str((profile or {}).get("yolo_vehicle_model") or "").strip()
+    candidates: list[Path | str] = []
+    if profile_model:
+        candidates.extend(
+            [
+                BASE_DIR / profile_model,
+                BASE_DIR / "models" / profile_model,
+                profile_model,
+            ]
+        )
+    candidates.extend(YOLO_VEHICLE_MODEL_CANDIDATES)
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        candidate_key = str(candidate)
+        if candidate_key in seen:
             continue
-        model = YOLO(str(candidate))
+        seen.add(candidate_key)
+        if isinstance(candidate, Path) and not candidate.exists():
+            continue
+        model = YOLO(candidate_key)
         try:
             model.to(yolo_device)
         except Exception:

@@ -2381,7 +2381,7 @@ def _page(
           previewNode.classList.remove("ready");
         }}
         if (livePlaceholder) {{
-          livePlaceholder.classList.remove("hidden");
+          livePlaceholder.classList.add("hidden");
         }}
         frameCanvas = document.createElement("canvas");
         liveStartedAt = Date.now();

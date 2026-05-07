@@ -392,9 +392,13 @@ def _extract_vehicle_predictions(
     vehicle_ids: list[int],
     tracker_config: str | None,
     yolo_device: str | None = None,
+    yolo_imgsz: int | None = None,
 ) -> list[tuple[int, int, int, int, int | None]]:
     if vehicle_model is None or not vehicle_ids:
         return []
+    yolo_kwargs = {}
+    if yolo_imgsz:
+        yolo_kwargs["imgsz"] = yolo_imgsz
     try:
         result = vehicle_model.track(
             source=frame,
@@ -404,6 +408,7 @@ def _extract_vehicle_predictions(
             tracker=tracker_config or "bytetrack.yaml",
             persist=True,
             verbose=False,
+            **yolo_kwargs,
         )[0]
     except Exception:
         try:
@@ -413,6 +418,7 @@ def _extract_vehicle_predictions(
                 conf=YOLO_VEHICLE_CONF,
                 device=yolo_device or YOLO_DEVICE,
                 verbose=False,
+                **yolo_kwargs,
             )[0]
         except Exception:
             return []
@@ -512,6 +518,7 @@ def _draw_overlay(
         vehicle_ids or [],
         tracker_config,
         str((profile or {}).get("yolo_device") or YOLO_DEVICE),
+        int((profile or {}).get("yolo_imgsz") or 0) or None,
     )
     predictions = _extract_plate_predictions(frame, ocr_engine, filter_mode=filter_mode)
     dangerous_plates = dangerous_plates or set()
