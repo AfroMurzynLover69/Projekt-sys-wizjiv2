@@ -1,5 +1,6 @@
 from pathlib import Path
 import shutil
+import warnings
 
 from .config import (
     BASE_DIR,
@@ -23,6 +24,23 @@ try:
     from ultralytics import YOLO
 except Exception:
     YOLO = None
+
+
+def _normalize_yolo_device(device: str) -> str:
+    normalized = str(device or YOLO_DEVICE).strip().lower()
+    if normalized in {"cpu", ""}:
+        return "cpu"
+
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return device
+    except Exception:
+        pass
+
+    warnings.warn("CUDA is not available for Ultralytics YOLO; using CPU for vehicle tracking.")
+    return "cpu"
 
 
 def _resolve_yolo_weight(model_name: str) -> Path | str:
@@ -82,7 +100,7 @@ def init_vehicle_tracker(profile: dict | None = None):
     if YOLO is None:
         return None, [], None
 
-    yolo_device = str((profile or {}).get("yolo_device") or YOLO_DEVICE)
+    yolo_device = _normalize_yolo_device(str((profile or {}).get("yolo_device") or YOLO_DEVICE))
     profile_model = str((profile or {}).get("yolo_vehicle_model") or "").strip()
     candidates: list[Path | str] = []
     if profile_model:

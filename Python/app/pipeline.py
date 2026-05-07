@@ -58,6 +58,7 @@ class RuntimeState:
 
 _RUNTIMES: dict[str, RuntimeState] = {}
 _RUNTIME_LOCK = Lock()
+_YOLO_WARNINGS: set[str] = set()
 NORMAL_COLOR = (0, 220, 120)
 DANGER_COLOR = (0, 0, 255)
 
@@ -114,6 +115,33 @@ def _mean_confidence(conf_raw) -> float:
     if isinstance(conf_raw, list):
         return float(sum(conf_raw) / max(1, len(conf_raw)))
     return float(conf_raw or 0.0)
+
+
+def _warn_yolo_once(key: str, message: str) -> None:
+    if key in _YOLO_WARNINGS:
+        return
+    _YOLO_WARNINGS.add(key)
+    print(message)
+
+
+def _yolo_device_candidates(requested_device: str | None) -> list[str]:
+    requested = str(requested_device or YOLO_DEVICE).strip() or YOLO_DEVICE
+    if requested.lower() == "cpu":
+        return ["cpu"]
+
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return [requested]
+    except Exception:
+        pass
+
+    _warn_yolo_once(
+        "cuda_unavailable",
+        "YOLO CUDA device is not available. Falling back to CPU for vehicle detection.",
+    )
+    return ["cpu"]
 
 
 def _read_image(path: Path):
@@ -399,29 +427,40 @@ def _extract_vehicle_predictions(
     yolo_kwargs = {}
     if yolo_imgsz:
         yolo_kwargs["imgsz"] = yolo_imgsz
-    try:
-        result = vehicle_model.track(
-            source=frame,
-            classes=vehicle_ids,
-            conf=YOLO_VEHICLE_CONF,
-            device=yolo_device or YOLO_DEVICE,
-            tracker=tracker_config or "bytetrack.yaml",
-            persist=True,
-            verbose=False,
-            **yolo_kwargs,
-        )[0]
-    except Exception:
+
+    result = None
+    for device in _yolo_device_candidates(yolo_device):
         try:
-            result = vehicle_model.predict(
+            result = vehicle_model.track(
                 source=frame,
                 classes=vehicle_ids,
                 conf=YOLO_VEHICLE_CONF,
-                device=yolo_device or YOLO_DEVICE,
+                device=device,
+                tracker=tracker_config or "bytetrack.yaml",
+                persist=True,
                 verbose=False,
                 **yolo_kwargs,
             )[0]
+            break
         except Exception:
-            return []
+            try:
+                result = vehicle_model.predict(
+                    source=frame,
+                    classes=vehicle_ids,
+                    conf=YOLO_VEHICLE_CONF,
+                    device=device,
+                    verbose=False,
+                    **yolo_kwargs,
+                )[0]
+                break
+            except Exception as error:
+                _warn_yolo_once(
+                    f"vehicle_predict_{device}",
+                    f"YOLO vehicle detection failed on device {device}: {error}",
+                )
+
+    if result is None:
+        return []
 
     if result.boxes is None or len(result.boxes) == 0:
         return []
