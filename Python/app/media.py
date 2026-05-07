@@ -23,4 +23,4 @@ def choose_media_file(cli_path: str | None = None) -> Path | None:
 
 
 def is_image_file(path: Path) -> bool:
-    return path.suffix.lower() in IMAGE_EXTENSIONS
+    return path.suffix.lower().strip() in IMAGE_EXTENSIONS

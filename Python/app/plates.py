@@ -45,6 +45,11 @@ def clean_plate_text(text: str) -> str:
         return ""
     if not any(ch.isdigit() for ch in cleaned):
         return ""
-    if extract_polish_root(cleaned) is None:
-        return ""
+        
+    import os
+    # Jeśli checkbox PL jest zaznaczony (zmienna '1'), weryfikujemy tablice polskie, jeśli nie, puszczamy wszystko.
+    if os.environ.get("ALPR_PL_FILTER_ONLY", "0") == "1":
+        if extract_polish_root(cleaned) is None:
+            return ""
+        
     return cleaned

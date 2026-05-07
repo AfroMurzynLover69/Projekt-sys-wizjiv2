@@ -1,8 +1,13 @@
 import base64
+import asyncio
+import ctypes
 import json
 import os
 import shutil
 import subprocess
+import sys
+import tempfile
+import threading
 import time
 from collections import Counter
 from html import escape
@@ -15,9 +20,9 @@ from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from .config import AI_PROFILES, APP_TITLE, DANGEROUS_PLATES_LIST
+from .config import AI_PROFILES, APP_TITLE, DANGEROUS_PLATES_LIST, PLATE_HISTORY_COOLDOWN_SECONDS
 from .config import DEFAULT_AI_PROFILE, RUNTIME_DEVICE, get_ai_profile
-from .pipeline import DetectionEvent, DetectionResult, analyze_frame, run_detection
+from .pipeline import DetectionEvent, DetectionResult, analyze_frame, analyze_frame_boxes, run_detection
 from .plates import clean_plate_text, extract_polish_root
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -26,6 +31,8 @@ UPLOADS_DIR = WEB_DATA_DIR / "uploads"
 RESULTS_DIR = WEB_DATA_DIR / "results"
 HISTORY_THUMBS_DIR = WEB_DATA_DIR / "history"
 HISTORY_FILE = WEB_DATA_DIR / "history.json"
+KEEP_UPLOADED_MEDIA = False
+KEEP_ANALYSIS_RESULTS = False
 
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -34,6 +41,7 @@ HISTORY_THUMBS_DIR.mkdir(parents=True, exist_ok=True)
 app = FastAPI(title=APP_TITLE)
 app.mount("/files", StaticFiles(directory=str(WEB_DATA_DIR)), name="files")
 LIVE_HISTORY_KEYS: dict[str, set[tuple[str, int]]] = {}
+PLATE_HISTORY_TIMERS: dict[str, float] = {}
 LAST_CPU_SAMPLE: tuple[int, int] | None = None
 LAST_PROCESS_SAMPLE: tuple[float, int] | None = None
 
@@ -122,6 +130,30 @@ def _parse_active_filters(active_filter: str) -> set[str]:
     return filters
 
 
+def _thumbnail_url(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    try:
+        relative = path.relative_to(WEB_DATA_DIR)
+    except ValueError:
+        return None
+    return "/files/" + "/".join(relative.parts)
+
+
+def _resolve_thumbnail_url(raw_url: str | None) -> str | None:
+    if not raw_url:
+        return None
+    value = str(raw_url)
+    if value.startswith("/files/"):
+        relative = value.removeprefix("/files/").replace("/", os.sep)
+        path = WEB_DATA_DIR / relative
+        return value if path.exists() else None
+    path = Path(value)
+    if path.exists():
+        return _thumbnail_url(path)
+    return None
+
+
 def _read_history() -> list[dict]:
     if not HISTORY_FILE.exists():
         return []
@@ -142,6 +174,7 @@ def _read_history() -> list[dict]:
             {
                 **item,
                 "plate": plate,
+                "thumbnail_url": _resolve_thumbnail_url(item.get("thumbnail_url")),
             }
         )
     return cleaned_history
@@ -154,14 +187,63 @@ def _write_history(entries: list[dict]) -> None:
     )
 
 
-def _thumbnail_url(path: Path | None) -> str | None:
-    if path is None:
-        return None
+def _clear_history_store() -> None:
+    HISTORY_FILE.write_text("[]\n", encoding="utf-8")
+    HISTORY_THUMBS_DIR.mkdir(parents=True, exist_ok=True)
+    for path in HISTORY_THUMBS_DIR.iterdir():
+        if path.is_file():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+    LIVE_HISTORY_KEYS.clear()
+    PLATE_HISTORY_TIMERS.clear()
+
+
+def _write_uploaded_media(data: bytes, suffix: str) -> Path:
+    if KEEP_UPLOADED_MEDIA:
+        safe_name = f"{uuid4().hex}{suffix}"
+        upload_path = UPLOADS_DIR / safe_name
+        upload_path.write_bytes(data)
+        return upload_path
+
+    handle = tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=suffix,
+        prefix="alpr_upload_",
+    )
     try:
-        relative = path.relative_to(WEB_DATA_DIR)
-    except ValueError:
-        return None
-    return "/files/" + "/".join(relative.parts)
+        handle.write(data)
+        return Path(handle.name)
+    finally:
+        handle.close()
+
+
+def _cleanup_uploaded_media(path: Path) -> None:
+    if KEEP_UPLOADED_MEDIA:
+        return
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _analysis_output_dir() -> Path | None:
+    if KEEP_ANALYSIS_RESULTS:
+        return RESULTS_DIR
+    output_dir = Path(tempfile.mkdtemp(prefix="alpr_results_"))
+    return output_dir
+
+
+def _cleanup_analysis_output(output_dir: Path | None, result: DetectionResult) -> None:
+    if KEEP_ANALYSIS_RESULTS or output_dir is None:
+        return
+    if result.output_path is not None:
+        result.output_path = None
+    try:
+        shutil.rmtree(output_dir)
+    except OSError:
+        pass
 
 
 def _event_to_entry(event: DetectionEvent) -> dict:
@@ -171,12 +253,62 @@ def _event_to_entry(event: DetectionEvent) -> dict:
         "source": event.source_name,
         "time": event.time_label,
         "seconds": round(event.time_seconds, 2),
+        "created_at": time.time(),
         "thumbnail_url": _thumbnail_url(event.thumbnail_path),
     }
 
 
+def _discard_event_thumbnail(event: DetectionEvent) -> None:
+    path = event.thumbnail_path
+    if path is None or not path.exists():
+        return
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _seed_plate_history_timers(history: list[dict]) -> None:
+    if PLATE_HISTORY_TIMERS:
+        return
+    for item in history:
+        plate = clean_plate_text(str(item.get("plate", "")))
+        if not plate:
+            continue
+        try:
+            created_at = float(item.get("created_at") or 0)
+        except (TypeError, ValueError):
+            continue
+        if created_at <= 0:
+            continue
+        PLATE_HISTORY_TIMERS[plate] = max(PLATE_HISTORY_TIMERS.get(plate, 0.0), created_at)
+
+
+def _filter_history_cooldown(events: list[DetectionEvent], history: list[dict]) -> list[DetectionEvent]:
+    if PLATE_HISTORY_COOLDOWN_SECONDS <= 0:
+        return events
+
+    _seed_plate_history_timers(history)
+    now = time.time()
+    fresh: list[DetectionEvent] = []
+    for event in events:
+        plate = clean_plate_text(event.plate_text)
+        if not plate:
+            _discard_event_thumbnail(event)
+            continue
+        last_seen = PLATE_HISTORY_TIMERS.get(plate, 0.0)
+        if now - last_seen < PLATE_HISTORY_COOLDOWN_SECONDS:
+            _discard_event_thumbnail(event)
+            continue
+        PLATE_HISTORY_TIMERS[plate] = now
+        event.plate_text = plate
+        fresh.append(event)
+    return fresh
+
+
 def _append_history(events: list[DetectionEvent]) -> list[dict]:
     history = _read_history()
+    events = _filter_history_cooldown(events, history)
     items = [_event_to_entry(event) for event in events]
     if items:
         history = items + history
@@ -189,13 +321,82 @@ def _append_live_history(session_id: str, events: list[DetectionEvent]) -> None:
         return
     seen = LIVE_HISTORY_KEYS.setdefault(session_id, set())
     fresh: list[DetectionEvent] = []
+    wall_time_bucket = int(time.time() // 10)
     for event in events:
-        key = (event.plate_text, int(event.time_seconds // 60))
+        key = (event.plate_text, wall_time_bucket)
         if key in seen:
             continue
         seen.add(key)
         fresh.append(event)
     _append_history(fresh)
+
+
+def _format_event_time(seconds: float) -> str:
+    total_seconds = max(0, int(seconds))
+    minutes, secs = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def _save_box_thumbnail(image, box: dict) -> Path | None:
+    try:
+        x1 = int(box.get("x1", 0))
+        y1 = int(box.get("y1", 0))
+        x2 = int(box.get("x2", 0))
+        y2 = int(box.get("y2", 0))
+    except (TypeError, ValueError):
+        return None
+
+    image_h, image_w = image.shape[:2]
+    pad = 18
+    x1 = max(0, min(x1 - pad, image_w - 1))
+    y1 = max(0, min(y1 - pad, image_h - 1))
+    x2 = max(x1 + 1, min(x2 + pad, image_w))
+    y2 = max(y1 + 1, min(y2 + pad, image_h))
+    crop = image[y1:y2, x1:x2]
+    if crop.size == 0:
+        return None
+
+    HISTORY_THUMBS_DIR.mkdir(parents=True, exist_ok=True)
+    path = HISTORY_THUMBS_DIR / f"{uuid4().hex}.png"
+    ok, encoded = cv2.imencode(".png", crop)
+    if not ok:
+        return None
+    try:
+        encoded.tofile(str(path))
+    except OSError:
+        return None
+    return path
+
+
+def _append_box_history(
+    session_id: str,
+    image,
+    payload: dict,
+    source_name: str,
+    seconds: float,
+) -> None:
+    events: list[DetectionEvent] = []
+    seen_plates: set[str] = set()
+    for box in payload.get("boxes", []):
+        if not isinstance(box, dict) or box.get("type") != "plate":
+            continue
+        plate = clean_plate_text(str(box.get("label", "")))
+        if not plate or plate in seen_plates:
+            continue
+        seen_plates.add(plate)
+        events.append(
+            DetectionEvent(
+                plate_text=plate,
+                source_name=source_name,
+                time_label=_format_event_time(seconds),
+                time_seconds=seconds,
+                thumbnail_path=_save_box_thumbnail(image, box),
+            )
+        )
+    _append_live_history(session_id, events)
 
 
 def _render_history(history: list[dict]) -> str:
@@ -369,6 +570,31 @@ def _render_analysis_history(history: list[dict], dangerous_plates: set[str]) ->
     return "".join(chunks) if chunks else '<div class="empty-state">Brak poprawnych wykryc</div>'
 
 
+def _history_payload(limit: int = 80) -> dict:
+    history = _read_history()
+    dangerous_plates = _read_dangerous_plates()
+    items: list[dict] = []
+    for item in history[:limit]:
+        plate = clean_plate_text(str(item.get("plate", "")))
+        if not plate:
+            continue
+        items.append(
+            {
+                "id": str(item.get("id") or ""),
+                "plate": plate,
+                "source": str(item.get("source", "")),
+                "time": str(item.get("time", "")),
+                "region": _plate_region(plate),
+                "dangerous": plate in dangerous_plates,
+                "thumbnail_url": _resolve_thumbnail_url(item.get("thumbnail_url")),
+            }
+        )
+    return {
+        "items": items,
+        "total": len(history),
+    }
+
+
 def _render_watchlist_items(plates: set[str]) -> str:
     if not plates:
         return '<div class="empty-state">Lista jest pusta</div>'
@@ -497,7 +723,7 @@ def _cpu_percent() -> int | None:
             load_1m = os.getloadavg()[0]
             cpu_count = os.cpu_count() or 1
             return round(min(100.0, (load_1m / cpu_count) * 100.0))
-        except OSError:
+        except (AttributeError, OSError):
             return None
 
     if LAST_CPU_SAMPLE is None:
@@ -513,11 +739,39 @@ def _cpu_percent() -> int | None:
     return round(max(0.0, min(100.0, busy)))
 
 
+def _windows_ram_percent() -> int | None:
+    if os.name != "nt":
+        return None
+
+    class MemoryStatus(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", ctypes.c_ulong),
+            ("dwMemoryLoad", ctypes.c_ulong),
+            ("ullTotalPhys", ctypes.c_ulonglong),
+            ("ullAvailPhys", ctypes.c_ulonglong),
+            ("ullTotalPageFile", ctypes.c_ulonglong),
+            ("ullAvailPageFile", ctypes.c_ulonglong),
+            ("ullTotalVirtual", ctypes.c_ulonglong),
+            ("ullAvailVirtual", ctypes.c_ulonglong),
+            ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+        ]
+
+    status = MemoryStatus()
+    status.dwLength = ctypes.sizeof(MemoryStatus)
+    try:
+        ok = ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
+    except (AttributeError, OSError):
+        return None
+    if not ok:
+        return None
+    return int(status.dwMemoryLoad)
+
+
 def _ram_percent() -> int | None:
     try:
         lines = Path("/proc/meminfo").read_text(encoding="utf-8").splitlines()
     except OSError:
-        return None
+        return _windows_ram_percent()
     values: dict[str, int] = {}
     for line in lines:
         key, _, value = line.partition(":")
@@ -554,36 +808,35 @@ def _read_process_cpu_ticks() -> int | None:
 def _process_cpu_percent() -> int | None:
     global LAST_PROCESS_SAMPLE
     ticks = _read_process_cpu_ticks()
-    if ticks is None:
-        return None
-
     now = time.monotonic()
+    if ticks is None:
+        process_seconds = time.process_time()
+    else:
+        try:
+            tick_rate = os.sysconf("SC_CLK_TCK")
+        except (AttributeError, ValueError, OSError):
+            tick_rate = 100
+        process_seconds = ticks / max(1, tick_rate)
+
     if LAST_PROCESS_SAMPLE is None:
-        LAST_PROCESS_SAMPLE = (now, ticks)
+        LAST_PROCESS_SAMPLE = (now, process_seconds)
         return None
 
-    previous_time, previous_ticks = LAST_PROCESS_SAMPLE
-    LAST_PROCESS_SAMPLE = (now, ticks)
+    previous_time, previous_process_seconds = LAST_PROCESS_SAMPLE
+    LAST_PROCESS_SAMPLE = (now, process_seconds)
     elapsed = now - previous_time
     if elapsed <= 0:
         return None
 
-    tick_rate = os.sysconf("SC_CLK_TCK")
-    cpu_seconds = (ticks - previous_ticks) / max(1, tick_rate)
+    cpu_seconds = process_seconds - previous_process_seconds
     return round(max(0.0, cpu_seconds / elapsed * 100.0))
 
 
 def _process_status() -> dict:
-    process_path = ""
-    try:
-        process_path = str(Path("/proc/self/exe").resolve())
-    except OSError:
-        process_path = ""
-
     return {
         "pid": os.getpid(),
         "cpu": _process_cpu_percent(),
-        "path": process_path,
+        "path": sys.executable,
     }
 
 
@@ -802,6 +1055,30 @@ def _page(
     .task-link.active {{
       background: #fff;
       color: #111;
+    }}
+    .shutdown-button {{
+      position: fixed;
+      top: 14px;
+      right: 14px;
+      z-index: 80;
+      min-height: 42px;
+      padding: 0 14px;
+      border: 1px solid rgba(255,255,255,0.16);
+      border-radius: 6px;
+      background: rgba(143,17,17,0.94);
+      color: #fff;
+      box-shadow: 0 10px 28px rgba(0,0,0,0.2);
+      cursor: pointer;
+      font: inherit;
+      font-weight: 900;
+      backdrop-filter: blur(10px);
+    }}
+    .shutdown-button:hover {{
+      background: #b41414;
+    }}
+    .shutdown-button:disabled {{
+      cursor: wait;
+      opacity: 0.72;
     }}
     .task-left,
     .task-status {{
@@ -1574,6 +1851,11 @@ def _page(
     .file-analysis-frame:not(.ready) {{
       display: none;
     }}
+    .box-overlay {{
+      z-index: 2;
+      pointer-events: none;
+      background: transparent;
+    }}
     #rawPreview {{
       display: none;
     }}
@@ -1686,6 +1968,12 @@ def _page(
         right: 8px;
         bottom: 150px;
       }}
+      .shutdown-button {{
+        top: 8px;
+        right: 8px;
+        min-height: 38px;
+        padding: 0 11px;
+      }}
       .task-left {{
         justify-content: space-between;
       }}
@@ -1716,6 +2004,12 @@ def _page(
   </style>
 </head>
 <body data-filter-mode="{escape(active_filter)}" data-ai-profile="{escape(profile['id'])}" data-ai-profiles="{profile_json}">
+  <!-- Checkbox globalny do zarzadzania tablicami PL / EU -->
+  <div style="position: absolute; top: 14px; left: 14px; z-index: 9999; display: flex; align-items: center; gap: 8px; background: rgba(0,0,0,0.5); color: white; padding: 6px 12px; border-radius: 6px; font-size: 13px;">
+    <input type="checkbox" id="platePolishFilterToggle" onchange="fetch('/api/toggle_pl_filter?state=' + (this.checked ? '1' : '0'))" />
+    <label for="platePolishFilterToggle">Wylacz wszystkie zagraniczne tablice (tylko PL)</label>
+  </div>
+  <button class="shutdown-button" id="shutdownButton" type="button" title="Wylacz serwer aplikacji">Wylacz</button>
   <div class="page">
     <main class="main">
       {content}
@@ -1824,6 +2118,7 @@ def _page(
   <script>
     const body = document.body;
     const fileButton = document.getElementById("fileButton");
+    const shutdownButton = document.getElementById("shutdownButton");
     const fileInput = document.getElementById("fileInput");
     const filterInput = document.getElementById("filterModeInput");
     const aiProfileInput = document.getElementById("aiProfileInput");
@@ -1836,6 +2131,7 @@ def _page(
     let screenStream = null;
     let previewVideo = null;
     let frameCanvas = null;
+    let liveAnalysisCanvas = null;
     let frameLoop = null;
     const liveSessionId = crypto?.randomUUID ? crypto.randomUUID() : String(Date.now());
     let liveStartedAt = 0;
@@ -1843,10 +2139,13 @@ def _page(
     let serialTimer = null;
     let activePreviewUrl = null;
     let filePreviewMedia = null;
-    let fileAnalysisImage = null;
+    let fileAnalysisCanvas = null;
     let fileFrameCanvas = null;
     let fileFrameLoop = null;
     let fileFrameBusy = false;
+    let fileFrameAbortController = null;
+    let fileFrameGeneration = 0;
+    let filePlateMemory = new Map();
     let fileSourceName = "Plik";
     let fileAnalysisSessionId = "";
     let currentAiProfile = body.dataset.aiProfile || "cpu_lite";
@@ -1872,6 +2171,16 @@ def _page(
       serialLine.textContent = `> ${{message}}`;
     }};
 
+    shutdownButton?.addEventListener("click", async () => {{
+      if (!confirm("Wylaczyc serwer aplikacji?")) return;
+      shutdownButton.disabled = true;
+      shutdownButton.textContent = "Wylaczam";
+      serialWrite("wylaczam serwer aplikacji");
+      try {{
+        await fetch("/shutdown", {{ method: "POST" }});
+      }} catch (_error) {{}}
+    }});
+
     const serialSequence = (messages, delay = 900) => {{
       if (serialTimer) {{
         clearInterval(serialTimer);
@@ -1896,6 +2205,59 @@ def _page(
       .replaceAll(">", "&gt;")
       .replaceAll('"', "&quot;")
       .replaceAll("'", "&#039;");
+
+    const renderHistoryItems = (items) => {{
+      if (!Array.isArray(items) || !items.length) {{
+        return '<div class="empty-state">Brak wykryc. Wgraj plik albo uruchom przechwytywanie ekranu.</div>';
+      }}
+      return items.map((item) => {{
+        const plate = htmlEscape(item.plate || "");
+        const source = htmlEscape(item.source || "");
+        const time = htmlEscape(item.time || "");
+        const region = htmlEscape(item.region || "");
+        const rowClass = item.dangerous ? "analysis-event danger" : "analysis-event";
+        const badge = item.dangerous
+          ? '<span class="analysis-badge danger">watchlista</span>'
+          : '<span class="analysis-badge">normalna</span>';
+        const thumb = item.thumbnail_url
+          ? `<img src="${{htmlEscape(item.thumbnail_url)}}?v=${{encodeURIComponent(item.id || Date.now())}}" alt="${{plate}}">`
+          : "";
+        return `
+<article class="${{rowClass}}" data-plate="${{plate}}">
+  <div class="event-thumb">${{thumb}}</div>
+  <div class="event-main">
+    <div class="event-title">
+      <strong>${{plate}}</strong>
+      ${{badge}}
+    </div>
+    <span>${{source}}</span>
+  </div>
+  <div class="event-meta">
+    <strong>${{region}}</strong>
+    <span>${{time}}</span>
+  </div>
+</article>`;
+      }}).join("");
+    }};
+
+    let lastHistorySignature = "";
+    const refreshHistoryPanel = async () => {{
+      const container = document.querySelector(".analysis-events");
+      if (!container) return;
+      try {{
+        const response = await fetch("/history-data", {{ cache: "no-store" }});
+        if (!response.ok) return;
+        const payload = await response.json();
+        const items = Array.isArray(payload.items) ? payload.items : [];
+        const signature = items.map((item) => `${{item.id}}:${{item.plate}}:${{item.time}}`).join("|");
+        if (signature === lastHistorySignature) return;
+        lastHistorySignature = signature;
+        container.innerHTML = renderHistoryItems(items);
+      }} catch (_error) {{}}
+    }};
+
+    refreshHistoryPanel();
+    setInterval(refreshHistoryPanel, 2500);
 
     const setPreviewMessage = (title, detail = "") => {{
       const resultPanel = document.querySelector(".result-panel");
@@ -1923,31 +2285,177 @@ def _page(
       return true;
     }};
 
-    const stopFileFrameLoop = () => {{
-      if (fileFrameLoop) {{
-        clearInterval(fileFrameLoop);
-        fileFrameLoop = null;
+    const drawBoxesOnCanvas = (canvas, payload) => {{
+      const incomingBoxes = Array.isArray(payload?.boxes) ? payload.boxes : [];
+      const width = Number(payload?.width) || 1;
+      const height = Number(payload?.height) || 1;
+      const now = performance.now();
+      const memoryTtl = currentAiProfile === "gpu_heavy" ? 1250 : 1800;
+      incomingBoxes.forEach((box) => {{
+        if (box.type !== "plate") return;
+        const label = String(box.label || "").trim();
+        if (!label) return;
+        filePlateMemory.set(label, {{
+          ...box,
+          seenAt: now,
+          width,
+          height,
+        }});
+      }});
+      for (const [label, box] of filePlateMemory.entries()) {{
+        if (box.width !== width || box.height !== height || now - box.seenAt > memoryTtl) {{
+          filePlateMemory.delete(label);
+        }}
       }}
+      const boxes = [
+        ...incomingBoxes.filter((box) => box.type === "vehicle"),
+        ...Array.from(filePlateMemory.values()),
+      ];
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext("2d");
+      if (!context) return;
+      context.clearRect(0, 0, width, height);
+      context.lineJoin = "round";
+      context.textBaseline = "bottom";
+
+      boxes.forEach((box) => {{
+        if (box.type !== "vehicle") return;
+        const x1 = Number(box.x1) || 0;
+        const y1 = Number(box.y1) || 0;
+        const x2 = Number(box.x2) || x1;
+        const y2 = Number(box.y2) || y1;
+        const boxWidth = Math.max(1, x2 - x1);
+        const boxHeight = Math.max(1, y2 - y1);
+        const isDangerous = Boolean(box.dangerous);
+        const color = isDangerous ? "#ff2f2f" : "#00dc78";
+        context.strokeStyle = color;
+        context.lineWidth = isDangerous ? 4 : 3;
+        context.strokeRect(x1, y1, boxWidth, boxHeight);
+        if (isDangerous) {{
+          context.strokeRect(Math.max(0, x1 - 6), Math.max(0, y1 - 6), boxWidth + 12, boxHeight + 12);
+        }}
+      }});
+
+      boxes.forEach((box) => {{
+        if (box.type !== "plate") return;
+        const x1 = Number(box.x1) || 0;
+        const y1 = Number(box.y1) || 0;
+        const x2 = Number(box.x2) || x1;
+        const y2 = Number(box.y2) || y1;
+        const boxWidth = Math.max(1, x2 - x1);
+        const boxHeight = Math.max(1, y2 - y1);
+        const isDangerous = Boolean(box.dangerous);
+        const boxColor = isDangerous ? "#ff2f2f" : "#ffd200";
+        const textColor = isDangerous ? "#ff2f2f" : "#00ff35";
+        const label = String(box.label || "");
+        context.strokeStyle = boxColor;
+        context.lineWidth = 2;
+        context.strokeRect(x1, y1, boxWidth, boxHeight);
+        if (isDangerous) {{
+          context.strokeRect(Math.max(0, x1 - 6), Math.max(0, y1 - 6), boxWidth + 12, boxHeight + 12);
+        }}
+        if (label) {{
+          const fontSize = Math.max(15, Math.round(width / 70));
+          context.font = `900 ${{fontSize}}px Arial, sans-serif`;
+          const confidence = Number(box.confidence);
+          const score = Number.isFinite(confidence) ? ` (${{confidence.toFixed(2)}})` : "";
+          const labelText = `${{isDangerous ? "!" : ""}}${{label}}${{score}}`;
+          const metrics = context.measureText(labelText);
+          const labelX = Math.max(0, Math.min(x1, width - metrics.width - 4));
+          const labelY = Math.max(fontSize + 2, y1 - 4);
+          context.lineWidth = 4;
+          context.strokeStyle = "rgba(0,0,0,0.68)";
+          context.strokeText(labelText, labelX, labelY);
+          context.fillStyle = textColor;
+          context.fillText(labelText, labelX, labelY);
+        }}
+      }});
+      canvas.classList.add("ready");
+    }};
+
+    const abortFileFrameRequest = () => {{
+      if (!fileFrameAbortController) return;
+      fileFrameAbortController.abort();
+      fileFrameAbortController = null;
+    }};
+
+    const clearAnalysisCanvas = () => {{
+      if (!fileAnalysisCanvas) return;
+      const context = fileAnalysisCanvas.getContext("2d");
+      if (context) {{
+        context.clearRect(0, 0, fileAnalysisCanvas.width || 1, fileAnalysisCanvas.height || 1);
+      }}
+      fileAnalysisCanvas.classList.remove("ready");
+    }};
+
+    const stopFileFrameTimer = () => {{
+      if (!fileFrameLoop) return;
+      clearTimeout(fileFrameLoop);
+      fileFrameLoop = null;
+    }};
+
+    const pauseFileFrameAnalysis = () => {{
+      stopFileFrameTimer();
+      abortFileFrameRequest();
+      fileFrameBusy = false;
+      fileFrameGeneration += 1;
+    }};
+
+    const stopFileFrameLoop = () => {{
+      stopFileFrameTimer();
+      abortFileFrameRequest();
+      fileFrameGeneration += 1;
       filePreviewMedia = null;
-      fileAnalysisImage = null;
+      fileAnalysisCanvas = null;
       fileFrameCanvas = null;
       fileFrameBusy = false;
+      filePlateMemory.clear();
       fileAnalysisSessionId = "";
     }};
 
+    const scheduleNextFileFrame = (delay = getLiveInterval()) => {{
+      if (!filePreviewMedia || filePreviewMedia.tagName !== "VIDEO") return;
+      if (filePreviewMedia.paused || filePreviewMedia.ended) return;
+      stopFileFrameTimer();
+      fileFrameLoop = setTimeout(() => {{
+        fileFrameLoop = null;
+        sendFileFrame();
+      }}, Math.max(30, delay));
+    }};
+
     const sendFileFrame = async () => {{
-      if (!filePreviewMedia || !fileFrameCanvas || !fileAnalysisImage || fileFrameBusy) return;
+      if (!filePreviewMedia || !fileFrameCanvas || !fileAnalysisCanvas || fileFrameBusy) return;
       const isVideo = filePreviewMedia.tagName === "VIDEO";
-      if (isVideo && (filePreviewMedia.readyState < 2 || filePreviewMedia.paused)) return;
+      if (isVideo && (filePreviewMedia.paused || filePreviewMedia.ended)) {{
+        return;
+      }}
+      if (isVideo && filePreviewMedia.readyState < 2) {{
+        scheduleNextFileFrame();
+        return;
+      }}
       const width = isVideo ? filePreviewMedia.videoWidth : filePreviewMedia.naturalWidth;
       const height = isVideo ? filePreviewMedia.videoHeight : filePreviewMedia.naturalHeight;
-      if (!width || !height) return;
+      if (!width || !height) {{
+        scheduleNextFileFrame();
+        return;
+      }}
 
-      if (!drawScaledFrame(filePreviewMedia, fileFrameCanvas, width, height)) return;
+      if (!drawScaledFrame(filePreviewMedia, fileFrameCanvas, width, height)) {{
+        scheduleNextFileFrame();
+        return;
+      }}
       const blob = await new Promise((resolve) => fileFrameCanvas.toBlob(resolve, "image/jpeg", getJpegQuality()));
-      if (!blob) return;
+      if (!blob) {{
+        scheduleNextFileFrame();
+        return;
+      }}
 
       fileFrameBusy = true;
+      const requestGeneration = fileFrameGeneration;
+      const controller = new AbortController();
+      fileFrameAbortController = controller;
+      const timeoutId = setTimeout(() => controller.abort(), 6500);
       try {{
         const data = new FormData();
         data.append("frame", new File([blob], "file-frame.jpg", {{ type: "image/jpeg" }}));
@@ -1956,30 +2464,46 @@ def _page(
         data.append("session_id", fileAnalysisSessionId || liveSessionId);
         data.append("filter_mode", serializeFilterModes());
         data.append("ai_profile", currentAiProfile);
-        const response = await fetch("/analyze-live-frame", {{ method: "POST", body: data }});
+        data.append("overlay_mode", "boxes");
+        data.append("include_vehicles", String(getCurrentProfileConfig().live_include_vehicles !== false));
+        const response = await fetch("/analyze-live-frame", {{
+          method: "POST",
+          body: data,
+          signal: controller.signal,
+        }});
+        if (requestGeneration !== fileFrameGeneration) return;
         if (!response.ok) return;
         const payload = await response.json();
-        if (payload.image) {{
-          fileAnalysisImage.src = payload.image;
-          fileAnalysisImage.classList.add("ready");
-          if (!fileAnalysisImage.dataset.firstFrame) {{
-            fileAnalysisImage.dataset.firstFrame = "1";
+        if (requestGeneration !== fileFrameGeneration) return;
+        if (payload.boxes) {{
+          drawBoxesOnCanvas(fileAnalysisCanvas, payload);
+          if (!fileAnalysisCanvas.dataset.firstFrame) {{
+            fileAnalysisCanvas.dataset.firstFrame = "1";
             serialWrite("podglad live: odebrano klatke z boxami");
           }}
         }}
       }} catch (_error) {{
       }} finally {{
-        fileFrameBusy = false;
+        clearTimeout(timeoutId);
+        if (fileFrameAbortController === controller) {{
+          fileFrameAbortController = null;
+        }}
+        if (requestGeneration === fileFrameGeneration) {{
+          fileFrameBusy = false;
+          scheduleNextFileFrame();
+        }}
       }}
     }};
 
-    const startFileFrameAnalysis = (media, file, analyzedImage) => {{
+    const startFileFrameAnalysis = (media, file, analysisCanvas) => {{
       stopFileFrameLoop();
       filePreviewMedia = media;
-      fileAnalysisImage = analyzedImage;
+      fileAnalysisCanvas = analysisCanvas;
       fileFrameCanvas = document.createElement("canvas");
       fileSourceName = file.name;
       fileAnalysisSessionId = crypto?.randomUUID ? crypto.randomUUID() : `file-${{Date.now()}}`;
+      filePlateMemory.clear();
+      fileFrameGeneration += 1;
 
       if (media.tagName === "IMG") {{
         media.addEventListener("load", sendFileFrame, {{ once: true }});
@@ -1987,10 +2511,20 @@ def _page(
       }}
 
       media.addEventListener("loadeddata", () => {{
-        sendFileFrame();
-        fileFrameLoop = setInterval(sendFileFrame, getLiveInterval());
+        if (!media.paused && !media.ended) {{
+          sendFileFrame();
+        }}
       }}, {{ once: true }});
+      media.addEventListener("play", () => {{
+        fileFrameGeneration += 1;
+        fileFrameBusy = false;
+        sendFileFrame();
+      }});
+      media.addEventListener("pause", () => {{
+        pauseFileFrameAnalysis();
+      }});
       media.addEventListener("ended", () => {{
+        pauseFileFrameAnalysis();
         serialWrite("podglad live: koniec odtwarzania pliku");
       }});
     }};
@@ -2021,21 +2555,13 @@ def _page(
         media.alt = file.name;
       }}
 
-      const analyzedImage = document.createElement("img");
-      analyzedImage.className = "preview-layer file-analysis-frame";
-      analyzedImage.alt = "Analizowana klatka z ramkami";
+      const analysisCanvas = document.createElement("canvas");
+      analysisCanvas.className = "preview-layer file-analysis-frame box-overlay";
+      analysisCanvas.setAttribute("aria-label", "Ramki z analizy");
 
-      const overlay = document.createElement("div");
-      overlay.className = "analysis-overlay";
-      const title = document.createElement("strong");
-      title.textContent = "Podglad z analiza live";
-      const detail = document.createElement("span");
-      detail.textContent = "Klatki sa wysylane do backendu i nakladane z boxami.";
-      overlay.append(title, detail);
-
-      stack.append(media, analyzedImage, overlay);
+      stack.append(media, analysisCanvas);
       resultPanel.replaceChildren(stack);
-      startFileFrameAnalysis(media, file, analyzedImage);
+      startFileFrameAnalysis(media, file, analysisCanvas);
       media.play?.().catch(() => {{}});
     }};
 
@@ -2106,12 +2632,21 @@ def _page(
       button.addEventListener("click", () => {{
         currentAiProfile = button.dataset.aiProfileValue || "cpu_lite";
         body.dataset.aiProfile = currentAiProfile;
+        abortFileFrameRequest();
+        fileFrameGeneration += 1;
+        fileFrameBusy = false;
+        filePlateMemory.clear();
+        clearAnalysisCanvas();
         syncProfileUi();
         const profile = getCurrentProfileConfig();
         serialWrite(`profil: ${{profile.label || currentAiProfile}}`);
-        if (fileFrameLoop && filePreviewMedia?.tagName === "VIDEO") {{
-          clearInterval(fileFrameLoop);
-          fileFrameLoop = setInterval(sendFileFrame, getLiveInterval());
+        if (filePreviewMedia?.tagName === "VIDEO") {{
+          stopFileFrameTimer();
+          if (!filePreviewMedia.paused && !filePreviewMedia.ended) {{
+            sendFileFrame();
+          }}
+        }} else if (fileFrameLoop) {{
+          stopFileFrameTimer();
         }}
       }});
     }});
@@ -2248,6 +2783,11 @@ def _page(
         previewNode.src = "";
         previewNode.classList.remove("ready");
       }}
+      if (liveAnalysisCanvas) {{
+        liveAnalysisCanvas.remove();
+        liveAnalysisCanvas = null;
+      }}
+      filePlateMemory.clear();
       if (livePlaceholder) {{
         livePlaceholder.classList.remove("hidden");
       }}
@@ -2271,12 +2811,13 @@ def _page(
         data.append("session_id", liveSessionId);
         data.append("filter_mode", serializeFilterModes());
         data.append("ai_profile", currentAiProfile);
+        data.append("overlay_mode", "boxes");
+        data.append("include_vehicles", String(getCurrentProfileConfig().live_include_vehicles !== false));
         const response = await fetch("/analyze-live-frame", {{ method: "POST", body: data }});
         if (!response.ok) return;
         const payload = await response.json();
-        if (previewNode && payload.image) {{
-          previewNode.src = payload.image;
-          previewNode.classList.add("ready");
+        if (liveAnalysisCanvas && payload.boxes) {{
+          drawBoxesOnCanvas(liveAnalysisCanvas, payload);
         }}
         if (livePlaceholder) {{
           livePlaceholder.classList.add("hidden");
@@ -2380,6 +2921,11 @@ def _page(
           previewNode.src = "";
           previewNode.classList.remove("ready");
         }}
+        liveAnalysisCanvas?.remove();
+        liveAnalysisCanvas = document.createElement("canvas");
+        liveAnalysisCanvas.className = "preview-layer file-analysis-frame box-overlay ready";
+        liveAnalysisCanvas.setAttribute("aria-label", "Ramki z analizy");
+        document.querySelector(".preview-stack")?.append(liveAnalysisCanvas);
         if (livePlaceholder) {{
           livePlaceholder.classList.add("hidden");
         }}
@@ -2589,6 +3135,12 @@ def _ranking_page() -> HTMLResponse:
     return _analysis_page()
 
 
+@app.get("/api/toggle_pl_filter")
+def api_toggle_pl_filter(state: str = "0"):
+    import os
+    os.environ["ALPR_PL_FILTER_ONLY"] = state
+    return {"status": "ok", "state": state}
+
 @app.get("/", response_class=HTMLResponse)
 def index() -> HTMLResponse:
     return _media_page(
@@ -2635,6 +3187,27 @@ def system_status():
     )
 
 
+@app.get("/history-data")
+def history_data():
+    return JSONResponse(_history_payload())
+
+
+@app.post("/history/clear")
+def clear_history():
+    _clear_history_store()
+    return JSONResponse({"ok": True})
+
+
+@app.post("/shutdown")
+def shutdown_app():
+    def stop_process() -> None:
+        time.sleep(0.25)
+        os._exit(0)
+
+    threading.Thread(target=stop_process, daemon=True).start()
+    return JSONResponse({"ok": True})
+
+
 @app.post("/watchlist/add", response_class=HTMLResponse)
 def add_watchlist_plate(plate: str = Form("")) -> HTMLResponse:
     cleaned = clean_plate_text(plate)
@@ -2677,23 +3250,26 @@ async def analyze(
     filter_mode: str = Form("normal"),
     ai_profile: str = Form(DEFAULT_AI_PROFILE),
 ) -> HTMLResponse:
-    original_name = media_file.filename or "plik.bin"
+    original_name = str(media_file.filename or "plik.bin").strip()
     suffix = Path(original_name).suffix.lower() or ".bin"
-    safe_name = f"{uuid4().hex}{suffix}"
-    upload_path = UPLOADS_DIR / safe_name
     data = await media_file.read()
-    upload_path.write_bytes(data)
-
-    result = run_detection(
-        upload_path,
-        output_dir=RESULTS_DIR,
-        preview=False,
-        source_name=original_name,
-        history_dir=HISTORY_THUMBS_DIR,
-        filter_mode=filter_mode,
-        ai_profile=ai_profile,
-    )
+    upload_path = _write_uploaded_media(data, suffix)
+    output_dir = _analysis_output_dir()
+    try:
+        result = await asyncio.to_thread(
+            run_detection,
+            upload_path,
+            output_dir=output_dir,
+            preview=False,
+            source_name=original_name,
+            history_dir=HISTORY_THUMBS_DIR,
+            filter_mode=filter_mode,
+            ai_profile=ai_profile,
+        )
+    finally:
+        _cleanup_uploaded_media(upload_path)
     _append_history(result.events)
+    _cleanup_analysis_output(output_dir, result)
     return _media_page(
         _render_result(result, original_name),
         active_filter=filter_mode,
@@ -2709,6 +3285,8 @@ async def analyze_live_frame(
     session_id: str = Form("default"),
     filter_mode: str = Form("normal"),
     ai_profile: str = Form(DEFAULT_AI_PROFILE),
+    overlay_mode: str = Form("image"),
+    include_vehicles: bool = Form(True),
 ):
     data = await frame.read()
     np_data = np.frombuffer(data, dtype=np.uint8)
@@ -2716,7 +3294,29 @@ async def analyze_live_frame(
     if image is None or image.size == 0:
         return JSONResponse({"image": None}, status_code=400)
 
-    annotated, events = analyze_frame(
+    profile = get_ai_profile(ai_profile)
+    if overlay_mode == "boxes":
+        boxes_payload = await asyncio.to_thread(
+            analyze_frame_boxes,
+            image,
+            filter_mode=filter_mode,
+            ai_profile=ai_profile,
+            include_vehicles=include_vehicles,
+        )
+        await asyncio.to_thread(
+            _append_box_history,
+            session_id,
+            image,
+            boxes_payload,
+            source_name,
+            seconds,
+        )
+        return JSONResponse(
+            boxes_payload
+        )
+
+    annotated, events = await asyncio.to_thread(
+        analyze_frame,
         image,
         source_name=source_name,
         seconds=seconds,
@@ -2725,7 +3325,8 @@ async def analyze_live_frame(
         ai_profile=ai_profile,
     )
     _append_live_history(session_id, events)
-    ok, encoded = cv2.imencode(".jpg", annotated)
+    jpeg_quality = int(max(50, min(95, round(float(profile.get("live_jpeg_quality") or 0.82) * 100))))
+    ok, encoded = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
     if not ok:
         return JSONResponse({"image": None}, status_code=500)
     payload = base64.b64encode(encoded.tobytes()).decode("ascii")

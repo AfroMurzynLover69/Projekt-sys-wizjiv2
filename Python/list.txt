@@ -3,3 +3,6 @@
 # Dozwolone sa tez wpisy z myslnikiem lub spacja (np. WR-3804R).
 
 EBECA32
+GA2344U
+GA8910M
+LU845TC

@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from pathlib import Path
-from threading import Lock
+from queue import Full, Queue
+from threading import Event, Lock, Thread
 from uuid import uuid4
 
 import cv2
@@ -61,6 +62,7 @@ _RUNTIME_LOCK = Lock()
 _YOLO_WARNINGS: set[str] = set()
 NORMAL_COLOR = (0, 220, 120)
 DANGER_COLOR = (0, 0, 255)
+_VIDEO_READER_DONE = object()
 
 
 def _check_highgui_support() -> bool:
@@ -147,11 +149,16 @@ def _yolo_device_candidates(requested_device: str | None) -> list[str]:
 def _read_image(path: Path):
     try:
         data = np.fromfile(str(path), dtype=np.uint8)
-    except OSError:
+    except OSError as e:
+        print(f"Read error OSError: {e}")
         return None
     if data.size == 0:
+        print("Read error: data.size == 0")
         return None
-    return cv2.imdecode(data, cv2.IMREAD_COLOR)
+    img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    if img is None:
+        print(f"Read error: cv2.imdecode returned None for path={path}")
+    return img
 
 
 def _write_image(path: Path, image) -> bool:
@@ -194,6 +201,71 @@ def _apply_filter_mode(frame, filter_mode: str):
         gray = cv2.cvtColor(filtered, cv2.COLOR_BGR2GRAY)
         filtered = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
     return filtered
+
+
+def _inference_max_width(profile: dict | None = None) -> int:
+    try:
+        return int((profile or {}).get("inference_max_width") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _resize_for_inference(frame, profile: dict | None = None):
+    max_width = _inference_max_width(profile)
+    frame_h, frame_w = frame.shape[:2]
+    if max_width <= 0 or frame_w <= max_width:
+        return frame, 1.0, 1.0
+
+    scale = max_width / max(1, frame_w)
+    target_w = max(1, int(round(frame_w * scale)))
+    target_h = max(1, int(round(frame_h * scale)))
+    resized = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
+    return resized, frame_w / target_w, frame_h / target_h
+
+
+def _scale_box(
+    box: tuple[int, int, int, int],
+    scale_x: float,
+    scale_y: float,
+    frame_w: int,
+    frame_h: int,
+) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = box
+    sx1 = max(0, min(int(round(x1 * scale_x)), frame_w - 1))
+    sy1 = max(0, min(int(round(y1 * scale_y)), frame_h - 1))
+    sx2 = max(sx1 + 1, min(int(round(x2 * scale_x)), frame_w))
+    sy2 = max(sy1 + 1, min(int(round(y2 * scale_y)), frame_h))
+    return sx1, sy1, sx2, sy2
+
+
+def _scale_plate_predictions(
+    predictions: list[tuple[int, int, int, int, str, float]],
+    scale_x: float,
+    scale_y: float,
+    frame_w: int,
+    frame_h: int,
+) -> list[tuple[int, int, int, int, str, float]]:
+    if scale_x == 1.0 and scale_y == 1.0:
+        return predictions
+    return [
+        (*_scale_box((x1, y1, x2, y2), scale_x, scale_y, frame_w, frame_h), text, confidence)
+        for x1, y1, x2, y2, text, confidence in predictions
+    ]
+
+
+def _scale_vehicle_predictions(
+    predictions: list[tuple[int, int, int, int, int | None]],
+    scale_x: float,
+    scale_y: float,
+    frame_w: int,
+    frame_h: int,
+) -> list[tuple[int, int, int, int, int | None]]:
+    if scale_x == 1.0 and scale_y == 1.0:
+        return predictions
+    return [
+        (*_scale_box((x1, y1, x2, y2), scale_x, scale_y, frame_w, frame_h), track_id)
+        for x1, y1, x2, y2, track_id in predictions
+    ]
 
 
 def _crop_region(image, box: tuple[int, int, int, int], pad: int = 10):
@@ -362,14 +434,17 @@ def _draw_double_box(
     cv2.rectangle(image, (ox1, oy1), (ox2, oy2), color, thickness)
 
 
-def _extract_plate_predictions(frame, ocr_engine, filter_mode: str = "normal") -> list[tuple[int, int, int, int, str, float]]:
+def _extract_plate_predictions(frame, ocr_engine, filter_mode: str = "normal", vehicle_predictions: list[tuple[int, int, int, int, int | None]] = None) -> list[tuple[int, int, int, int, str, float]]:
+    filter_modes = _parse_filter_modes(filter_mode)
+
+    # Odpalamy na pelnym kadrze, zeby zoptymalizowac procesor (1 skan na calosc zamiast wielu na skrawkach!)
+    # Odciaza to CPU calkowicie poniewaz ONNX GPU radzi sobie ze spora klatka szybciej niz z X wycinkami 
     try:
         results = ocr_engine.predict(frame)
     except Exception:
         return []
 
     frame_h, frame_w = frame.shape[:2]
-    filter_modes = _parse_filter_modes(filter_mode)
     predictions: list[tuple[int, int, int, int, str, float]] = []
 
     for result in results:
@@ -409,6 +484,13 @@ def _extract_plate_predictions(frame, ocr_engine, filter_mode: str = "normal") -
             continue
         if confidence < PLATE_MIN_CONFIDENCE:
             continue
+            
+        # Bezpieczne filtrowanie punktow na jezdni - jezeli YOLO dziala, to MUSI znalezc auto by uznac tablice
+        if vehicle_predictions is not None:
+            matched = _match_plate_to_vehicle((x1, y1, x2, y2), vehicle_predictions)
+            if matched is None:
+                continue
+
         predictions.append((x1, y1, x2, y2, text, confidence))
 
     return predictions
@@ -439,6 +521,7 @@ def _extract_vehicle_predictions(
                 tracker=tracker_config or "bytetrack.yaml",
                 persist=True,
                 verbose=False,
+                max_det=50,
                 **yolo_kwargs,
             )[0]
             break
@@ -450,6 +533,7 @@ def _extract_vehicle_predictions(
                     conf=YOLO_VEHICLE_CONF,
                     device=device,
                     verbose=False,
+                    max_det=50,
                     **yolo_kwargs,
                 )[0]
                 break
@@ -551,15 +635,31 @@ def _draw_overlay(
     profile: dict | None = None,
 ):
     annotated = frame.copy()
-    vehicle_predictions = _extract_vehicle_predictions(
-        frame,
+    inference_frame, scale_x, scale_y = _resize_for_inference(frame, profile)
+    frame_h, frame_w = frame.shape[:2]
+    vehicle_predictions_unscaled = _extract_vehicle_predictions(
+        inference_frame,
         vehicle_model,
         vehicle_ids or [],
         tracker_config,
         str((profile or {}).get("yolo_device") or YOLO_DEVICE),
         int((profile or {}).get("yolo_imgsz") or 0) or None,
     )
-    predictions = _extract_plate_predictions(frame, ocr_engine, filter_mode=filter_mode)
+    vehicle_predictions = _scale_vehicle_predictions(
+        vehicle_predictions_unscaled,
+        scale_x,
+        scale_y,
+        frame_w,
+        frame_h,
+    )
+    predictions = _extract_plate_predictions(inference_frame, ocr_engine, filter_mode=filter_mode, vehicle_predictions=vehicle_predictions_unscaled)
+    predictions = _scale_plate_predictions(
+        predictions,
+        scale_x,
+        scale_y,
+        frame_w,
+        frame_h,
+    )
     dangerous_plates = dangerous_plates or set()
     dangerous_plate_indexes: set[int] = set()
     dangerous_vehicle_indexes: set[int] = set()
@@ -574,6 +674,7 @@ def _draw_overlay(
 
     _draw_vehicle_overlay(annotated, vehicle_predictions, dangerous_vehicle_indexes)
 
+    out_predictions = []
     for idx, (x1, y1, x2, y2, text, confidence) in enumerate(predictions):
         is_dangerous = idx in dangerous_plate_indexes
         if is_dangerous:
@@ -594,6 +695,15 @@ def _draw_overlay(
             2,
             cv2.LINE_AA,
         )
+        
+        # Zapiszmy koordynaty pojazdu jezeli zostal przypisany (dla miniaturki)
+        match_idx = _match_plate_to_vehicle((x1, y1, x2, y2), vehicle_predictions)
+        if match_idx is not None:
+            vx1, vy1, vx2, vy2, _ = vehicle_predictions[match_idx]
+            out_box = (vx1, vy1, vx2, vy2)
+        else:
+            out_box = (x1, y1, x2, y2)
+        out_predictions.append((out_box[0], out_box[1], out_box[2], out_box[3], text, confidence))
 
     cv2.putText(
         annotated,
@@ -605,7 +715,7 @@ def _draw_overlay(
         2,
         cv2.LINE_AA,
     )
-    return annotated, predictions
+    return annotated, out_predictions
 
 
 def _format_time_label(seconds: float) -> str:
@@ -705,13 +815,100 @@ def analyze_frame(
         profile=runtime.profile,
     )
     events = _build_events_from_predictions(
-        annotated,
+        processed_frame, # zmienione z "annotated" aby uciac z czystej klatki i wreszcie pokazac tablice bez markerow!
         predictions,
         source_name,
         seconds,
         history_dir,
     )
     return annotated, events
+
+
+def analyze_frame_boxes(
+    frame,
+    filter_mode: str = "normal",
+    ai_profile: str = DEFAULT_AI_PROFILE,
+    include_vehicles: bool = True,
+) -> dict:
+    runtime = _get_runtime(ai_profile)
+    processed_frame = _apply_filter_mode(frame, filter_mode)
+    inference_frame, scale_x, scale_y = _resize_for_inference(processed_frame, runtime.profile)
+    frame_h, frame_w = processed_frame.shape[:2]
+    vehicle_predictions: list[tuple[int, int, int, int, int | None]] = []
+    if include_vehicles:
+        vehicle_predictions_unscaled = _extract_vehicle_predictions(
+            inference_frame,
+            runtime.vehicle_model,
+            runtime.vehicle_ids,
+            runtime.tracker_config,
+            str(runtime.profile.get("yolo_device") or YOLO_DEVICE),
+            int(runtime.profile.get("yolo_imgsz") or 0) or None,
+        )
+        
+    plate_predictions_raw = _extract_plate_predictions(
+        inference_frame,
+        runtime.ocr_engine,
+        filter_mode=filter_mode,
+        vehicle_predictions=vehicle_predictions_unscaled if include_vehicles else [],
+    )
+    
+    if include_vehicles:
+        vehicle_predictions = _scale_vehicle_predictions(
+            vehicle_predictions_unscaled,
+            scale_x,
+            scale_y,
+            frame_w,
+            frame_h,
+        )
+        
+    plate_predictions = _scale_plate_predictions(
+        plate_predictions_raw,
+        scale_x,
+        scale_y,
+        frame_w,
+        frame_h,
+    )
+    
+    dangerous_plates = _refresh_dangerous_plates(runtime)
+    dangerous_vehicle_indexes: set[int] = set()
+    plate_boxes: list[dict] = []
+
+    for x1, y1, x2, y2, text, confidence in plate_predictions:
+        dangerous = text in dangerous_plates
+        if dangerous:
+            match_idx = _match_plate_to_vehicle((x1, y1, x2, y2), vehicle_predictions)
+            if match_idx is not None:
+                dangerous_vehicle_indexes.add(match_idx)
+        plate_boxes.append(
+            {
+                "type": "plate",
+                "x1": x1,
+                "y1": y1,
+                "x2": x2,
+                "y2": y2,
+                "label": text,
+                "confidence": round(confidence, 3),
+                "dangerous": dangerous,
+            }
+        )
+
+    vehicle_boxes = [
+        {
+            "type": "vehicle",
+            "x1": x1,
+            "y1": y1,
+            "x2": x2,
+            "y2": y2,
+            "label": YOLO_VEHICLE_LABEL if track_id is None else f"{YOLO_VEHICLE_LABEL} ID {track_id}",
+            "dangerous": idx in dangerous_vehicle_indexes,
+        }
+        for idx, (x1, y1, x2, y2, track_id) in enumerate(vehicle_predictions)
+    ]
+    return {
+        "width": frame_w,
+        "height": frame_h,
+        "boxes": vehicle_boxes + plate_boxes,
+    }
 
 
 def run_image_detection(
@@ -757,7 +954,7 @@ def run_image_detection(
         print(f"Save error: {out_path}")
 
     events = _build_events_from_predictions(
-        annotated,
+        processed_frame, # Uzywamy czystej klatki jak w video, aby uniknac obcinania pomazanej miniaturki
         predictions,
         source_label,
         0.0,
@@ -773,6 +970,37 @@ def run_image_detection(
         _close_preview(can_preview)
 
     return DetectionResult(0 if saved else 1, out_path if saved else None, "image", events)
+
+
+def _start_video_reader(cap, queue_size: int) -> tuple[Queue, Event, Thread]:
+    queue: Queue = Queue(maxsize=max(1, queue_size))
+    stop_event = Event()
+
+    def put_item(item) -> bool:
+        while not stop_event.is_set():
+            try:
+                queue.put(item, timeout=0.1)
+                return True
+            except Full:
+                continue
+        return False
+
+    def read_loop() -> None:
+        frame_number = 0
+        try:
+            while not stop_event.is_set():
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                frame_number += 1
+                if not put_item((frame_number, frame)):
+                    break
+        finally:
+            put_item(_VIDEO_READER_DONE)
+
+    thread = Thread(target=read_loop, name="video-reader", daemon=True)
+    thread.start()
+    return queue, stop_event, thread
 
 
 def run_detection(
@@ -832,13 +1060,19 @@ def run_detection(
     processed_predictions: list[tuple[int, int, int, int, str, float]] = []
     history_keys: set[tuple[str, int]] = set()
     events: list[DetectionEvent] = []
+    queue_size = int(runtime.profile.get("video_read_queue_size") or 4)
+    try:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, queue_size)
+    except cv2.error:
+        pass
+    frame_queue, stop_reader, reader_thread = _start_video_reader(cap, queue_size)
 
     try:
         while True:
-            ok, frame = cap.read()
-            if not ok:
+            item = frame_queue.get()
+            if item is _VIDEO_READER_DONE:
                 break
-            frame_idx += 1
+            frame_idx, frame = item
             seconds = (frame_idx - 1) / effective_fps if effective_fps > 0 else 0.0
             every_n_frames = int(runtime.profile.get("ai_every_n_frames") or AI_EVERY_N_FRAMES)
             should_process = last_out is None or (frame_idx % max(1, every_n_frames)) == 0
@@ -880,6 +1114,8 @@ def run_detection(
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
     finally:
+        stop_reader.set()
+        reader_thread.join(timeout=1.5)
         cap.release()
         writer.release()
         _close_preview(can_preview)
