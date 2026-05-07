@@ -56,6 +56,19 @@ def _read_dangerous_plates() -> set[str]:
     return values
 
 
+def _write_dangerous_plates(plates: set[str]) -> None:
+    DANGEROUS_PLATES_LIST.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        '# Watchlista tablic "niebezpiecznych" kierowcow.',
+        "# Format: jedna rejestracja na linie.",
+        "# Dozwolone sa tez wpisy z myslnikiem lub spacja (np. WR-3804R).",
+        "",
+        *sorted(plates),
+        "",
+    ]
+    DANGEROUS_PLATES_LIST.write_text("\n".join(lines), encoding="utf-8")
+
+
 def _plate_region(plate: str) -> str:
     return extract_polish_root(plate) or "INNE"
 
@@ -356,6 +369,83 @@ def _render_analysis_history(history: list[dict], dangerous_plates: set[str]) ->
     return "".join(chunks) if chunks else '<div class="empty-state">Brak poprawnych wykryc</div>'
 
 
+def _render_watchlist_items(plates: set[str]) -> str:
+    if not plates:
+        return '<div class="empty-state">Lista jest pusta</div>'
+
+    chunks: list[str] = []
+    for plate in sorted(plates):
+        region = _plate_region(plate)
+        chunks.append(
+            f"""
+<article class="watchlist-item">
+  <div>
+    <strong>{escape(plate)}</strong>
+    <span>Region: {escape(region)}</span>
+  </div>
+  <form action="/watchlist/remove" method="post">
+    <input type="hidden" name="plate" value="{escape(plate)}">
+    <button class="watchlist-remove" type="submit" aria-label="Usun {escape(plate)}">Usun</button>
+  </form>
+</article>
+"""
+        )
+    return "".join(chunks)
+
+
+def _render_search_plate_buttons(history: list[dict], dangerous_plates: set[str]) -> str:
+    counts = Counter(clean_plate_text(str(item.get("plate", ""))) for item in history)
+    counts.pop("", None)
+    if not counts:
+        return '<div class="empty-state" id="searchPlateEmpty">Brak tablic w historii</div>'
+
+    chunks: list[str] = []
+    for plate, count in sorted(counts.items()):
+        state = "danger" if plate in dangerous_plates else "normal"
+        label = "black" if plate in dangerous_plates else "normal"
+        chunks.append(
+            f"""
+<button class="search-plate-button {state}" type="button" data-search-plate="{escape(plate)}" hidden>
+  <strong>{escape(plate)}</strong>
+  <span>{count} zdjec | {label}</span>
+</button>
+"""
+        )
+    return "".join(chunks)
+
+
+def _render_search_results(history: list[dict], dangerous_plates: set[str]) -> str:
+    if not history:
+        return '<div class="empty-state">Brak wykryc. Najpierw uruchom analize pliku albo ekranu.</div>'
+
+    chunks: list[str] = []
+    for item in history:
+        plate = clean_plate_text(str(item.get("plate", "")))
+        if not plate:
+            continue
+        is_dangerous = plate in dangerous_plates
+        state = "danger" if is_dangerous else "normal"
+        label = "blacklista" if is_dangerous else "normalna"
+        thumb = item.get("thumbnail_url")
+        thumb_html = f'<img src="{escape(thumb)}" alt="{escape(plate)}">' if thumb else '<span>brak zdjecia</span>'
+        chunks.append(
+            f"""
+<article class="search-card {state}" data-search-card data-search-plate="{escape(plate)}" hidden>
+  <div class="search-thumb">{thumb_html}</div>
+  <div class="search-card-copy">
+    <div>
+      <strong>{escape(plate)}</strong>
+      <span class="search-state {state}">{label}</span>
+    </div>
+    <span>{escape(str(item.get("time", "")))}</span>
+    <small>{escape(str(item.get("source", "")))}</small>
+  </div>
+</article>
+"""
+        )
+    return "".join(chunks) if chunks else '<div class="empty-state">Brak poprawnych tablic w historii</div>'
+
+
 def _render_result(result: DetectionResult, original_name: str) -> str:
     if result.exit_code != 0 or result.output_path is None:
         return f"""
@@ -561,6 +651,8 @@ def _render_nav(active_view: str) -> str:
     items = [
         ("/", "Media", active_view == "media"),
         ("/analysis", "Analiza", active_view == "analysis"),
+        ("/search", "Szukaj", active_view == "search"),
+        ("/watchlist", "Watchlista", active_view == "watchlist"),
     ]
     links: list[str] = []
     for href, label, is_active in items:
@@ -1092,6 +1184,233 @@ def _page(
       color: var(--ink);
       font: inherit;
     }}
+    .watchlist-layout {{
+      display: grid;
+      grid-template-columns: minmax(0, 0.9fr) minmax(380px, 1.1fr);
+      gap: 18px;
+      align-items: start;
+    }}
+    .watchlist-form {{
+      display: grid;
+      gap: 12px;
+    }}
+    .watchlist-form label {{
+      display: grid;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 0.86rem;
+      font-weight: 800;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }}
+    .watchlist-input {{
+      width: 100%;
+      min-height: 52px;
+      padding: 0 14px;
+      border: 1px solid rgba(17,17,17,0.12);
+      border-radius: 8px;
+      background: #fff;
+      color: var(--ink);
+      font: inherit;
+      font-size: 1.05rem;
+      font-weight: 800;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }}
+    .watchlist-submit,
+    .watchlist-remove {{
+      appearance: none;
+      min-height: 44px;
+      border: 0;
+      border-radius: 8px;
+      padding: 0 15px;
+      background: rgba(17,17,17,0.92);
+      color: #fff;
+      cursor: pointer;
+      font: inherit;
+      font-weight: 800;
+    }}
+    .watchlist-remove {{
+      background: #8f1111;
+    }}
+    .watchlist-message {{
+      padding: 12px 14px;
+      border-radius: 8px;
+      background: rgba(31,157,85,0.1);
+      border: 1px solid rgba(31,157,85,0.22);
+      color: #17633b;
+      font-weight: 700;
+    }}
+    .watchlist-message.error {{
+      background: rgba(157,17,17,0.08);
+      border-color: rgba(157,17,17,0.2);
+      color: #8f1111;
+    }}
+    .watchlist-list {{
+      display: grid;
+      gap: 10px;
+    }}
+    .watchlist-item {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 12px;
+      align-items: center;
+      padding: 12px;
+      border-radius: 8px;
+      border: 1px solid rgba(17,17,17,0.08);
+      background: rgba(255,255,255,0.68);
+    }}
+    .watchlist-item div {{
+      min-width: 0;
+      display: grid;
+      gap: 5px;
+    }}
+    .watchlist-item strong {{
+      letter-spacing: 0.06em;
+    }}
+    .watchlist-item span {{
+      color: var(--muted);
+      font-size: 0.9rem;
+    }}
+    .search-layout {{
+      display: grid;
+      grid-template-columns: minmax(300px, 0.8fr) minmax(0, 1.2fr);
+      gap: 18px;
+      align-items: start;
+    }}
+    .search-box {{
+      display: grid;
+      gap: 14px;
+    }}
+    .search-input {{
+      width: 100%;
+      min-height: 58px;
+      padding: 0 15px;
+      border: 2px solid rgba(17,17,17,0.14);
+      border-radius: 8px;
+      background: #fff;
+      color: var(--ink);
+      font: inherit;
+      font-size: 1.2rem;
+      font-weight: 900;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }}
+    .search-counter {{
+      color: var(--muted);
+      font-size: 0.92rem;
+      font-weight: 700;
+    }}
+    .search-plate-list {{
+      display: grid;
+      gap: 9px;
+      max-height: 520px;
+      overflow: auto;
+      padding-right: 4px;
+    }}
+    .search-plate-button {{
+      appearance: none;
+      width: 100%;
+      min-height: 58px;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+      border-radius: 8px;
+      padding: 10px 12px;
+      background: rgba(255,255,255,0.7);
+      color: var(--ink);
+      cursor: pointer;
+      font: inherit;
+      text-align: left;
+    }}
+    .search-plate-button.normal {{
+      border: 2px solid #1f9d55;
+    }}
+    .search-plate-button.danger {{
+      border: 2px solid #8f1111;
+    }}
+    .search-plate-button.active {{
+      background: rgba(17,17,17,0.92);
+      color: #fff;
+      border-color: rgba(17,17,17,0.92);
+    }}
+    .search-plate-button strong {{
+      letter-spacing: 0.06em;
+    }}
+    .search-plate-button span {{
+      color: inherit;
+      font-size: 0.86rem;
+      opacity: 0.72;
+    }}
+    .search-results {{
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+      gap: 12px;
+    }}
+    .search-card {{
+      overflow: hidden;
+      border-radius: 8px;
+      background: rgba(255,255,255,0.78);
+      box-shadow: 0 12px 24px rgba(17,17,17,0.08);
+    }}
+    .search-card.normal {{
+      border: 4px solid #1f9d55;
+    }}
+    .search-card.danger {{
+      border: 4px solid #8f1111;
+    }}
+    .search-thumb {{
+      aspect-ratio: 16 / 10;
+      display: grid;
+      place-items: center;
+      background: #111;
+      color: rgba(255,255,255,0.62);
+      font-weight: 800;
+    }}
+    .search-thumb img {{
+      width: 100%;
+      height: 100%;
+      display: block;
+      object-fit: cover;
+    }}
+    .search-card-copy {{
+      display: grid;
+      gap: 7px;
+      padding: 12px;
+    }}
+    .search-card-copy div {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }}
+    .search-card-copy strong {{
+      letter-spacing: 0.06em;
+    }}
+    .search-card-copy span,
+    .search-card-copy small {{
+      color: var(--muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }}
+    .search-state {{
+      min-height: 26px;
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 4px 8px;
+      color: #fff !important;
+      font-size: 0.76rem;
+      font-weight: 900;
+    }}
+    .search-state.normal {{
+      background: #1f9d55;
+    }}
+    .search-state.danger {{
+      background: #8f1111;
+    }}
     .empty-state {{
       padding: 16px;
       border-radius: 8px;
@@ -1335,7 +1654,9 @@ def _page(
         grid-template-columns: 1fr;
       }}
       .metric-grid,
-      .analysis-columns {{
+      .analysis-columns,
+      .search-layout,
+      .watchlist-layout {{
         grid-template-columns: 1fr;
       }}
       .panel-head {{
@@ -1806,6 +2127,66 @@ def _page(
       }});
     }});
 
+    const plateSearchInput = document.getElementById("plateSearchInput");
+    const searchCards = Array.from(document.querySelectorAll("[data-search-card]"));
+    const searchButtons = Array.from(document.querySelectorAll("[data-search-plate]"))
+      .filter((node) => node.tagName === "BUTTON");
+    const searchCount = document.getElementById("searchCount");
+    const searchEmpty = document.getElementById("searchEmpty");
+    const normalizePlateInput = (value) => String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+
+    const applyPlateSearch = (exactPlate = "") => {{
+      if (!plateSearchInput) return;
+      const query = normalizePlateInput(plateSearchInput.value);
+      const exact = normalizePlateInput(exactPlate);
+      const activeQuery = exact || query;
+      let visibleCards = 0;
+      let visibleButtons = 0;
+
+      searchCards.forEach((card) => {{
+        const plate = card.dataset.searchPlate || "";
+        const isVisible = Boolean(activeQuery) && (exact ? plate === exact : plate.includes(activeQuery));
+        card.hidden = !isVisible;
+        if (isVisible) visibleCards += 1;
+      }});
+
+      searchButtons.forEach((button) => {{
+        const plate = button.dataset.searchPlate || "";
+        const isVisible = Boolean(query) && plate.includes(query);
+        button.hidden = !isVisible;
+        button.classList.toggle("active", Boolean(activeQuery) && plate === activeQuery);
+        if (isVisible) visibleButtons += 1;
+      }});
+
+      if (searchCount) {{
+        if (!activeQuery) {{
+          searchCount.textContent = "Wpisz pierwsza litere rejestracji";
+        }} else {{
+          searchCount.textContent = `${{visibleCards}} zdjec | ${{visibleButtons}} pasujacych tablic`;
+        }}
+      }}
+      if (searchEmpty) {{
+        searchEmpty.hidden = !activeQuery || visibleCards > 0;
+      }}
+    }};
+
+    plateSearchInput?.addEventListener("input", () => {{
+      plateSearchInput.value = normalizePlateInput(plateSearchInput.value);
+      applyPlateSearch();
+    }});
+
+    searchButtons.forEach((button) => {{
+      button.addEventListener("click", () => {{
+        const plate = button.dataset.searchPlate || "";
+        if (!plateSearchInput || !plate) return;
+        plateSearchInput.value = plate;
+        applyPlateSearch(plate);
+        serialWrite(`szukam dokladnie: ${{plate}}`);
+      }});
+    }});
+
+    applyPlateSearch();
+
     const serializeFilterModes = () => {{
       if (!currentFilterModes.size) {{
         return "normal";
@@ -2117,6 +2498,89 @@ def _analysis_page() -> HTMLResponse:
     return _page(content, "analysis", "normal")
 
 
+def _watchlist_page(message: str = "", error: str = "") -> HTMLResponse:
+    plates = _read_dangerous_plates()
+    notice = ""
+    if error:
+        notice = f'<div class="watchlist-message error">{escape(error)}</div>'
+    elif message:
+        notice = f'<div class="watchlist-message">{escape(message)}</div>'
+
+    content = f"""
+<section class="hero">
+  <div>
+    <h1>Watchlista</h1>
+    <p>Czarna lista rejestracji uzywana przy oznaczaniu trafien w analizie.</p>
+  </div>
+</section>
+<section class="watchlist-layout">
+  <section class="panel">
+    <div class="panel-head">
+      <div>
+        <p>Dodawanie</p>
+        <h2>Nowa rejestracja</h2>
+      </div>
+    </div>
+    <form class="watchlist-form" action="/watchlist/add" method="post">
+      <label>
+        Numer tablicy
+        <input class="watchlist-input" name="plate" type="text" placeholder="EBECA32" autocomplete="off" required>
+      </label>
+      <button class="watchlist-submit" type="submit">Dodaj do listy</button>
+      {notice}
+    </form>
+  </section>
+  <section class="panel">
+    <div class="panel-head">
+      <div>
+        <p>{len(plates)} wpisow</p>
+        <h2>Aktualna lista</h2>
+      </div>
+    </div>
+    <div class="watchlist-list">{_render_watchlist_items(plates)}</div>
+  </section>
+</section>
+"""
+    return _page(content, "watchlist", "normal")
+
+
+def _search_page() -> HTMLResponse:
+    history = _read_history()
+    dangerous_plates = _read_dangerous_plates()
+    content = f"""
+<section class="hero">
+  <div>
+    <h1>Szukaj</h1>
+    <p>Wpisz rejestracje. Wyniki i zdjecia pojawiaja sie od pierwszej litery.</p>
+  </div>
+</section>
+<section class="search-layout">
+  <section class="panel search-box">
+    <div class="panel-head">
+      <div>
+        <p>Rejestracja</p>
+        <h2>Wyszukiwarka</h2>
+      </div>
+    </div>
+    <input class="search-input" id="plateSearchInput" type="search" placeholder="EBECA32" autocomplete="off" autofocus>
+    <div class="search-counter" id="searchCount">Wpisz pierwsza litere rejestracji</div>
+    <div class="search-plate-list">{_render_search_plate_buttons(history, dangerous_plates)}</div>
+  </section>
+  <section class="panel">
+    <div class="panel-head">
+      <div>
+        <p>Zdjecia</p>
+        <h2>Historia trafien</h2>
+      </div>
+    </div>
+    <div class="empty-state" id="searchEmpty" hidden>Brak zdjec dla tej rejestracji</div>
+    <div class="search-results">{_render_search_results(history, dangerous_plates)}</div>
+  </section>
+</section>
+"""
+    return _page(content, "search", "normal")
+
+
 def _history_page() -> HTMLResponse:
     return _analysis_page()
 
@@ -2135,6 +2599,16 @@ def index() -> HTMLResponse:
 @app.get("/analysis", response_class=HTMLResponse)
 def analysis_page() -> HTMLResponse:
     return _analysis_page()
+
+
+@app.get("/watchlist", response_class=HTMLResponse)
+def watchlist_page() -> HTMLResponse:
+    return _watchlist_page()
+
+
+@app.get("/search", response_class=HTMLResponse)
+def search_page() -> HTMLResponse:
+    return _search_page()
 
 
 @app.get("/history", response_class=HTMLResponse)
@@ -2159,6 +2633,42 @@ def system_status():
             "profiles": AI_PROFILES,
         }
     )
+
+
+@app.post("/watchlist/add", response_class=HTMLResponse)
+def add_watchlist_plate(plate: str = Form("")) -> HTMLResponse:
+    cleaned = clean_plate_text(plate)
+    if not cleaned:
+        return _watchlist_page(error="Podaj poprawna polska rejestracje, np. EBECA32 albo WR-3804R.")
+
+    plates = _read_dangerous_plates()
+    if cleaned in plates:
+        return _watchlist_page(message=f"{cleaned} jest juz na watchliscie.")
+
+    plates.add(cleaned)
+    try:
+        _write_dangerous_plates(plates)
+    except OSError:
+        return _watchlist_page(error="Nie udalo sie zapisac listy do pliku.")
+    return _watchlist_page(message=f"Dodano {cleaned} do watchlisty.")
+
+
+@app.post("/watchlist/remove", response_class=HTMLResponse)
+def remove_watchlist_plate(plate: str = Form("")) -> HTMLResponse:
+    cleaned = clean_plate_text(plate)
+    if not cleaned:
+        return _watchlist_page(error="Nie rozpoznano tablicy do usuniecia.")
+
+    plates = _read_dangerous_plates()
+    if cleaned not in plates:
+        return _watchlist_page(message=f"{cleaned} nie ma juz na watchliscie.")
+
+    plates.remove(cleaned)
+    try:
+        _write_dangerous_plates(plates)
+    except OSError:
+        return _watchlist_page(error="Nie udalo sie zapisac listy do pliku.")
+    return _watchlist_page(message=f"Usunieto {cleaned} z watchlisty.")
 
 
 @app.post("/analyze", response_class=HTMLResponse)

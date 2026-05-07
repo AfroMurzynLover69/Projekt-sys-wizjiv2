@@ -52,11 +52,14 @@ class RuntimeState:
     vehicle_ids: list[int]
     tracker_config: str | None
     dangerous_plates: set[str]
+    dangerous_plates_mtime: float | None
     profile: dict
 
 
 _RUNTIMES: dict[str, RuntimeState] = {}
 _RUNTIME_LOCK = Lock()
+NORMAL_COLOR = (0, 220, 120)
+DANGER_COLOR = (0, 0, 255)
 
 
 def _check_highgui_support() -> bool:
@@ -91,6 +94,7 @@ def _get_runtime(profile_id: str | None = None) -> RuntimeState:
             vehicle_ids=vehicle_ids,
             tracker_config=tracker_config,
             dangerous_plates=_load_dangerous_plates(DANGEROUS_PLATES_LIST),
+            dangerous_plates_mtime=_dangerous_plates_mtime(DANGEROUS_PLATES_LIST),
             profile=profile,
         )
         _RUNTIMES[profile_key] = runtime
@@ -296,6 +300,21 @@ def _load_dangerous_plates(path: Path) -> set[str]:
     return dangerous
 
 
+def _dangerous_plates_mtime(path: Path) -> float | None:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def _refresh_dangerous_plates(runtime: RuntimeState) -> set[str]:
+    current_mtime = _dangerous_plates_mtime(DANGEROUS_PLATES_LIST)
+    if current_mtime != runtime.dangerous_plates_mtime:
+        runtime.dangerous_plates = _load_dangerous_plates(DANGEROUS_PLATES_LIST)
+        runtime.dangerous_plates_mtime = current_mtime
+    return runtime.dangerous_plates
+
+
 def _draw_double_box(
     image,
     x1: int,
@@ -455,7 +474,7 @@ def _draw_vehicle_overlay(
 ) -> None:
     for idx, (x1, y1, x2, y2, track_id) in enumerate(vehicle_predictions):
         is_dangerous = idx in dangerous_vehicle_indexes
-        color = (0, 0, 255) if is_dangerous else (0, 220, 120)
+        color = DANGER_COLOR if is_dangerous else NORMAL_COLOR
         if is_dangerous:
             _draw_double_box(annotated, x1, y1, x2, y2, color, thickness=2, gap=5)
         else:
@@ -512,13 +531,13 @@ def _draw_overlay(
     for idx, (x1, y1, x2, y2, text, confidence) in enumerate(predictions):
         is_dangerous = idx in dangerous_plate_indexes
         if is_dangerous:
-            _draw_double_box(annotated, x1, y1, x2, y2, (0, 0, 255), thickness=2, gap=4)
+            _draw_double_box(annotated, x1, y1, x2, y2, DANGER_COLOR, thickness=2, gap=4)
             plate_label = f"NIEBEZPIECZNY {text} ({confidence:.2f})"
-            plate_color = (0, 0, 255)
+            plate_color = DANGER_COLOR
         else:
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 170, 255), 2)
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), NORMAL_COLOR, 2)
             plate_label = f"{text} ({confidence:.2f})"
-            plate_color = (0, 255, 0)
+            plate_color = NORMAL_COLOR
         cv2.putText(
             annotated,
             plate_label,
@@ -635,7 +654,7 @@ def analyze_frame(
         runtime.vehicle_model,
         runtime.vehicle_ids,
         runtime.tracker_config,
-        runtime.dangerous_plates,
+        _refresh_dangerous_plates(runtime),
         filter_mode=filter_mode,
         profile=runtime.profile,
     )
@@ -683,7 +702,7 @@ def run_image_detection(
         runtime.vehicle_model,
         runtime.vehicle_ids,
         runtime.tracker_config,
-        runtime.dangerous_plates,
+        _refresh_dangerous_plates(runtime),
         filter_mode=filter_mode,
         profile=runtime.profile,
     )
@@ -786,7 +805,7 @@ def run_detection(
                     runtime.vehicle_model,
                     runtime.vehicle_ids,
                     runtime.tracker_config,
-                    runtime.dangerous_plates,
+                    _refresh_dangerous_plates(runtime),
                     filter_mode=filter_mode,
                     profile=runtime.profile,
                 )

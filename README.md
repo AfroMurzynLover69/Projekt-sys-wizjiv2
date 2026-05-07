@@ -54,8 +54,9 @@ wynikow.
 - analiza przechwyconego ekranu,
 - rysowanie ramek wokol pojazdow i tablic,
 - wypisywanie odczytanego numeru tablicy nad ramka,
-- lista obserwowanych tablic w `Python/list.txt`,
+- lista obserwowanych tablic w `Python/list.txt` z edycja z poziomu zakladki `Watchlista`,
 - zakladka `Analiza` z historia, rankingiem tablic, regionami i trafieniami z watchlisty,
+- zakladka `Szukaj` do filtrowania historii po rejestracji i ogladania zdjec,
 - profile pracy `CPU Lite` i `GPU Heavy`,
 - monitor pracy aplikacji z PID procesu Pythona, zuzyciem CPU, RAM i GPU.
 
@@ -88,7 +89,7 @@ wlacza wykrywanie/sledzenie pojazdow i tworzy pelny wynikowy film z ramkami.
 
 ## Najwazniejsze pliki
 
-- `Python/app/web.py` - interfejs WWW, monitor, profile CPU/GPU i endpointy,
+- `Python/app/web.py` - interfejs WWW, monitor, profile CPU/GPU, watchlista i endpointy,
 - `Python/app/pipeline.py` - glowna logika analizy obrazu i rysowania ramek,
 - `Python/app/models_runtime.py` - ladowanie modeli ALPR i YOLO,
 - `Python/app/config.py` - konfiguracja progow, modeli i profili pracy,
